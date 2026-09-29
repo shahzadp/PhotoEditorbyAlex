@@ -1,8 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!--
+        The window is drawn edge-to-edge (MainActivity calls enableEdgeToEdge),
+        so the system bars must be transparent. Leaving them opaque made the
+        editor content slide underneath them, and the opaque bar was painted on
+        top of the camera notch and the three-button navigation bar.
+    -->
     <style name="Theme.PhotoEditor" parent="android:Theme.Material.NoActionBar">
-        <item name="android:statusBarColor">#FF101014</item>
-        <item name="android:navigationBarColor">#FF101014</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:windowBackground">#FF101014</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
     </style>
 </resources>

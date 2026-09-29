@@ -14,6 +14,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
+import java.io.File
 
 /**
  * The complete, serialisable description of an edit.
@@ -22,6 +24,7 @@ import kotlinx.coroutines.withContext
  * render is derived from it. That is what makes the editor non-destructive:
  * changing any value simply re-derives the preview from [original].
  */
+@Serializable
 data class EditState(
     val adjustments: Adjustments = Adjustments.NEUTRAL,
     val filterId: String = "original",
@@ -34,7 +37,23 @@ data class EditState(
     val resizeWidth: Int? = null,
     val resizeHeight: Int? = null,
     /** Phase 2 professional colour: curves, levels, HSL, selective colour. */
-    val colorGrade: ColorGrade = ColorGrade()
+    val colorGrade: ColorGrade = ColorGrade(),
+    /**
+     * Background removal from the "tap to select" tool.
+     *
+     * The mask is held as normalised anchor points rather than pixels so the
+     * state stays small, serialisable and non-destructive. The mask is
+     * re-derived from the original on every render, so changing any other
+     * setting later reuses the same selection.
+     */
+    val cutout: CutoutState = CutoutState(),
+    /**
+     * Images stacked on top of the base photo, in draw order.
+     *
+     * At most [ImageLayer.MAX_LAYERS]. Held as file paths plus transforms so
+     * the state remains serialisable; the bitmaps live in [LayerStore].
+     */
+    val layers: List<ImageLayer> = emptyList()
 ) {
     val isDefault: Boolean
         get() = adjustments.isNeutral &&
@@ -45,7 +64,9 @@ data class EditState(
             crop == null &&
             resizeWidth == null &&
             resizeHeight == null &&
-            colorGrade.isNeutral
+            colorGrade.isNeutral &&
+            cutout.isNone &&
+            layers.isEmpty()
 
     /** Human-readable summary for the history panel. */
     fun describe(): String = buildList {
@@ -55,6 +76,10 @@ data class EditState(
         if (flipV) add("Flip vertical")
         if (crop != null) add("Crop")
         if (resizeWidth != null) add("Resize")
+        if (cutout.isActive) add("Cutout")
+        if (layers.isNotEmpty()) {
+            add(if (layers.size == 1) "1 layer" else "${layers.size} layers")
+        }
         if (filterId != "original") add("Filter")
         if (!colorGrade.isNeutral) {
             val touched = buildList {
@@ -76,6 +101,36 @@ data class HistoryEntry(
     val label: String
 )
 
+/**
+ * A "tap to select" background removal.
+ *
+ * [anchors] are normalised points (0..1) in the *uncropped* image space where
+ * the user tapped. Each tap selects the object under that point, and all taps
+ * together build up the mask. Storing points rather than the mask itself keeps
+ * the state tiny and lets the model re-run at whatever resolution the current
+ * render needs.
+ */
+@Serializable
+data class CutoutState(
+    val anchors: List<TapAnchor> = emptyList(),
+    /** True to keep the selected object, false to remove it. */
+    val keepSubject: Boolean = true,
+    /** Confidence threshold in [0,1]; below this counts as background. */
+    val threshold: Float = 0.5f,
+    /** Feathering width, so the edge is not a hard jaggy line. */
+    val feather: Float = 0.12f
+) {
+    val isActive: Boolean get() = anchors.isNotEmpty()
+    val isNone: Boolean get() = !isActive
+
+    /** True when taps should add to the selection rather than replace it. */
+    val additive: Boolean get() = anchors.size > 1
+}
+
+/** A single tap, in normalised image coordinates. */
+@Serializable
+data class TapAnchor(val x: Float, val y: Float)
+
 /** Everything the UI needs to render one frame. */
 data class PreviewState(
     val bitmap: Bitmap? = null,
@@ -91,7 +146,23 @@ data class PreviewState(
     val canRedo: Boolean = false,
     val historyIndex: Int = 0,
     val historySize: Int = 0,
-    val compareHeld: Boolean = false
+    val compareHeld: Boolean = false,
+    /**
+     * True until a grid thumbnail has been written for this project.
+     *
+     * Tracked in the state so the autosave path can throttle thumbnail writes
+     * without a separate flag on the repository.
+     */
+    val thumbnailMissing: Boolean = true,
+    /**
+     * The layer stack, mirrored here so the UI can observe it.
+     *
+     * The panel must read the stack from an observable source: reading it
+     * straight from the repository left the composable holding a stale
+     * `visible` flag, so the eye toggle kept setting it to the same value and
+     * a hidden layer could never be shown again.
+     */
+    val layers: List<ImageLayer> = emptyList()
 )
 
 /**
@@ -111,7 +182,12 @@ class EditorRepository(
     private val filterEngine: FilterEngine = FilterEngine(),
     private val geometryEngine: GeometryEngine = GeometryEngine(),
     private val colorGradeEngine: ColorGradeEngine = ColorGradeEngine(),
-    private val renderDispatcher: CoroutineDispatcher = Dispatchers.Default
+    private val renderDispatcher: CoroutineDispatcher = Dispatchers.Default,
+    /**
+     * Background removal. Supplied by the ViewModel because the MediaPipe
+     * engine needs a Context, and the repository itself has none.
+     */
+    private val cutoutComposer: CutoutComposer? = null
 ) {
 
     /**
@@ -122,11 +198,39 @@ class EditorRepository(
         adjustmentEngine = adjustmentEngine,
         filterEngine = filterEngine,
         geometryEngine = geometryEngine,
-        colorGradeEngine = colorGradeEngine
+        colorGradeEngine = colorGradeEngine,
+        cutoutComposer = cutoutComposer,
+        // Layers are composited *inside* the renderer, before the colour
+        // stages, so filters and adjustments apply to the flattened stack
+        // rather than only to the base photo.
+        layerBitmaps = { layer -> layerStore.bitmapFor(layer) }
     )
+
+    /**
+     * Backing store for layer bitmaps.
+     *
+     * A byte-budgeted LRU, so holding ten layers costs a bounded amount of
+     * memory instead of one full decode per layer.
+     */
+    private val layerStore = LayerStore()
 
     private val _preview = MutableStateFlow(PreviewState())
     val preview: StateFlow<PreviewState> = _preview.asStateFlow()
+
+    /**
+     * Bumped whenever [current] changes for any reason.
+     *
+     * A single chokepoint so autosave cannot be forgotten on one of the many
+     * state-mutating paths. Counting changes rather than comparing whole states
+     * keeps this cheap: a counter compare is free, whereas a deep equality walk
+     * over every curve point and every layer would run per frame.
+     */
+    private val _revision = MutableStateFlow(0)
+    val revision: StateFlow<Int> = _revision.asStateFlow()
+
+    private fun markChanged() {
+        _revision.value = _revision.value + 1
+    }
 
     /** The untouched decoded image. All rendering starts here. */
     private var original: Bitmap? = null
@@ -140,7 +244,35 @@ class EditorRepository(
     private var renderJob: Job? = null
     private val renderScope = CoroutineScope(Dispatchers.Default)
 
+    /**
+     * Set when state changed while a render was in flight.
+     *
+     * Guarded by [renderMutex] rather than being atomic: it is only ever
+     * touched from the render loop and the scheduling path, and the loop
+     * clears it before each pass.
+     */
+    @Volatile
+    private var renderRequested = false
+
     private var lastRenderedBitmap: Bitmap? = null
+
+    /**
+     * The app-private copy of the open image.
+     *
+     * Kept because a project has to point at a file that still exists
+     * tomorrow; the original content URI grant will not.
+     */
+    private var sourceFile: File? = null
+
+    /** Id of the project this session is writing to, once one exists. */
+    @Volatile
+    var projectId: String? = null
+        private set
+
+    /** Display name shown in the projects grid. */
+    @Volatile
+    var projectName: String = "Untitled"
+        private set
 
     // ------------------------------------------------------------- loading
 
@@ -154,9 +286,14 @@ class EditorRepository(
             lastRenderedBitmap?.recycle()
 
             original = loaded.bitmap
+            // ImageLoader already imported a private copy, so that file is
+            // the one a project should point at.
+            sourceFile = loaded.sourceFile
             current = EditState()
             undoStack.clear()
             redoStack.clear()
+            projectId = null
+            projectName = loaded.info.displayName
 
             _preview.value = PreviewState(
                 bitmap = loaded.bitmap,
@@ -177,6 +314,137 @@ class EditorRepository(
         }
     }
 
+    /**
+     * Closes the current image and returns to the picker.
+     *
+     * Nothing is recycled: with no edits applied, `state.bitmap` *is* the
+     * original bitmap, and Compose may still be drawing it this frame.
+     * Recycling here would crash with "trying to use a recycled bitmap", which
+     * is the same class of bug the crop work hit. The GC reclaims it once the
+     * UI drops the reference.
+     */
+    fun close() {
+        renderJob?.cancel()
+        renderJob = null
+        renderRequested = false
+
+        cutoutComposer?.invalidate()
+
+        val wasOpen = original != null
+
+        original = null
+        lastRenderedBitmap = null
+        current = EditState()
+        undoStack.clear()
+        redoStack.clear()
+        activeToolIsCrop = false
+        cropCanvasKey = null
+        cropCanvas = null
+        sourceFile = null
+        projectId = null
+
+        if (wasOpen) {
+            _preview.value = PreviewState()
+        }
+    }
+
+    // --------------------------------------------------------- image layers
+
+    /** The current layer stack, in draw order. */
+    fun currentLayers(): List<ImageLayer> = current.layers
+
+    val canAddLayer: Boolean get() = current.layers.size < ImageLayer.MAX_LAYERS
+
+    val layerCount: Int get() = current.layers.size
+
+    /**
+     * Imports a layer image and adds it on top.
+     *
+     * The picked file is copied into app-private storage first, because the
+     * picker's URI grant is temporary and the layer must still be readable at
+     * export time.
+     */
+    suspend fun addLayer(context: android.content.Context, uri: Uri) {
+        if (!canAddLayer) return
+        try {
+            val file = ImageStore.import(context, uri)
+            val layer = ImageLayer(
+                id = java.util.UUID.randomUUID().toString(),
+                sourcePath = file.absolutePath
+            )
+            update({ it.copy(layers = it.layers + layer) }, "Add layer")
+        } catch (t: Throwable) {
+            _preview.value = _preview.value.copy(
+                error = t.message ?: "Could not add that image"
+            )
+        }
+    }
+
+    /** Applies a transform change to one layer. */
+    fun updateLayer(id: String, transform: (ImageLayer) -> ImageLayer, label: String) =
+        update(
+            { state ->
+                state.copy(
+                    layers = state.layers.map { if (it.id == id) transform(it) else it }
+                )
+            },
+            label
+        )
+
+    fun setLayerScale(id: String, scale: Float) = updateLayer(
+        id,
+        { it.copy(scale = scale.coerceIn(0.05f, 3f)) },
+        "Resize layer"
+    )
+
+    fun setLayerOffset(id: String, x: Float, y: Float) = updateLayer(
+        id,
+        { it.copy(offsetX = x, offsetY = y) },
+        "Move layer"
+    )
+
+    fun setLayerRotation(id: String, degrees: Float) = updateLayer(
+        id,
+        { it.copy(rotationDegrees = ((degrees + 180f) % 360f) - 180f) },
+        "Rotate layer"
+    )
+
+    fun setLayerOpacity(id: String, opacity: Float) = updateLayer(
+        id,
+        { it.copy(opacity = opacity.coerceIn(0f, 1f)) },
+        "Layer opacity"
+    )
+
+    fun setLayerVisible(id: String, visible: Boolean) = updateLayer(
+        id,
+        { it.copy(visible = visible) },
+        "Toggle layer"
+    )
+
+    fun resetLayer(id: String) = updateLayer(
+        id,
+        { LayerComposer.resetTransform(it) },
+        "Reset layer"
+    )
+
+    /** Removes a layer and frees its cached bitmap. */
+    fun removeLayer(id: String) {
+        layerStore.evict(id)
+        update({ it.copy(layers = it.layers.filterNot { l -> l.id == id }) }, "Remove layer")
+    }
+
+    /** Brings a layer to the front of the stack. */
+    fun bringLayerToFront(id: String) = update({ state ->
+        val target = state.layers.firstOrNull { it.id == id } ?: return@update state
+        state.copy(layers = state.layers.filterNot { it.id == id } + target)
+    }, "Bring to front")
+
+    /** Sends a layer behind all the others. */
+    fun sendLayerToBack(id: String) = update({ state ->
+        val target = state.layers.firstOrNull { it.id == id } ?: return@update state
+        state.copy(layers = listOf(target) + state.layers.filterNot { it.id == id })
+    }, "Send to back")
+
     // ------------------------------------------------------- state changes
 
     /** Pushes a new state and re-renders. Used for discrete tool actions. */
@@ -189,6 +457,7 @@ class EditorRepository(
         redoStack.clear()
 
         current = next
+        markChanged()
         scheduleRender()
     }
 
@@ -206,6 +475,7 @@ class EditorRepository(
         current = current.copy(
             adjustments = kind.with(base, value)
         )
+        markChanged()
         scheduleRender()
     }
 
@@ -274,6 +544,7 @@ class EditorRepository(
     fun updateCropLive(rect: CropRect) {
         if (cropGestureStart == null) cropGestureStart = current
         current = current.copy(crop = rect)
+        markChanged()
         scheduleRender()
     }
 
@@ -332,6 +603,7 @@ class EditorRepository(
         undoStack.addLast(HistoryEntry(current, "Reset"))
         redoStack.clear()
         current = EditState()
+        markChanged()
         scheduleRender()
     }
 
@@ -397,6 +669,7 @@ class EditorRepository(
         val next = current.copy(colorGrade = transform(base.colorGrade))
         if (next == current) return
         current = next
+        markChanged()
         scheduleRender()
     }
 
@@ -440,12 +713,59 @@ class EditorRepository(
         )
     )
 
+    // -------------------------------------------- "tap to select" cutout
+
+    /** True when the MediaPipe model is present and usable. */
+    val cutoutAvailable: Boolean get() = cutoutComposer != null
+
+    /**
+     * Adds a tap to the selection.
+     *
+     * The first tap starts a new selection; later taps extend it, so tapping a
+     * person and then their bag keeps both. [replace] forces a new selection
+     * instead, which is what the "New selection" button uses.
+     */
+    fun addTap(x: Float, y: Float, replace: Boolean = false) {
+        val existing = current.cutout
+        val anchors = if (replace) {
+            listOf(TapAnchor(x.coerceIn(0f, 1f), y.coerceIn(0f, 1f)))
+        } else {
+            existing.anchors + TapAnchor(x.coerceIn(0f, 1f), y.coerceIn(0f, 1f))
+        }
+        cutoutComposer?.invalidate()
+        update(
+            { it.copy(cutout = it.cutout.copy(anchors = anchors)) },
+            if (replace) "Select object" else "Add to selection"
+        )
+    }
+
+    /** Clears the selection and restores the original background. */
+    fun clearCutout() {
+        if (!current.cutout.isActive) return
+        cutoutComposer?.invalidate()
+        update({ it.copy(cutout = CutoutState()) }, "Clear selection")
+    }
+
+    fun setCutoutKeepSubject(keep: Boolean) =
+        update({ it.copy(cutout = it.cutout.copy(keepSubject = keep)) }, "Keep subject")
+
+    fun setCutoutThreshold(value: Float) = update(
+        { it.copy(cutout = it.cutout.copy(threshold = value.coerceIn(0.05f, 0.95f))) },
+        "Cutout threshold"
+    )
+
+    fun setCutoutFeather(value: Float) = update(
+        { it.copy(cutout = it.cutout.copy(feather = value.coerceIn(0f, 0.4f))) },
+        "Edge softness"
+    )
+
     // ------------------------------------------------------------- history
 
     fun undo() {
         val entry = undoStack.removeLastOrNull() ?: return
         redoStack.addLast(HistoryEntry(current, entry.label))
         current = entry.state
+        markChanged()
         scheduleRender()
     }
 
@@ -453,6 +773,7 @@ class EditorRepository(
         val entry = redoStack.removeLastOrNull() ?: return
         undoStack.addLast(HistoryEntry(current, entry.label))
         current = entry.state
+        markChanged()
         scheduleRender()
     }
 
@@ -470,18 +791,170 @@ class EditorRepository(
         }
 
         current = targetState
+        markChanged()
         scheduleRender()
     }
 
     // ------------------------------------------------------------ rendering
 
     private fun scheduleRender() {
-        renderJob?.cancel()
-        renderJob = renderScope.launch { render() }
+        // Coalesce rather than cancel-and-restart.
+        //
+        // Cancelling mid-render threw away a partially finished frame and
+        // started the whole pipeline again, so a fast drag could starve the
+        // pipeline completely and the preview would only catch up once the
+        // finger stopped. Instead, at most one render runs and any request
+        // that arrives while it is busy sets a flag that triggers exactly one
+        // more pass on the newest state.
+        renderRequested = true
+        if (renderJob?.isActive == true) return
+        renderJob = renderScope.launch { drainRenders() }
+    }
+
+    /**
+     * Renders until no further state changes are pending.
+     *
+     * Each pass re-reads [current], so several slider updates that arrived
+     * mid-render collapse into a single follow-up frame on the latest values.
+     */
+    private suspend fun drainRenders() {
+        while (renderRequested) {
+            renderRequested = false
+            render()
+        }
+    }
+
+    /**
+     * Opens a saved project, restoring both the image and the whole edit.
+     *
+     * The state is assigned directly rather than replayed through [update], so
+     * reopening a project does not push a dozen undo entries or leave the
+     * redo stack littered.
+     */
+    suspend fun openProject(
+        context: android.content.Context,
+        project: Project
+    ) {
+        _preview.value = _preview.value.copy(isLoading = true, error = null)
+        try {
+            val file = File(project.sourcePath)
+            val loaded = ImageLoader.loadFromFile(context, file, project.displayName)
+            original?.recycle()
+            lastRenderedBitmap?.recycle()
+
+            original = loaded.bitmap
+            sourceFile = file
+            current = project.state
+            undoStack.clear()
+            redoStack.clear()
+            projectId = project.id
+            projectName = project.displayName
+            cropSessionReset = true
+
+            _preview.value = PreviewState(
+                bitmap = loaded.bitmap,
+                original = loaded.bitmap,
+                info = loaded.info,
+                isLoading = false,
+                layers = current.layers
+            )
+            scheduleRender()
+        } catch (t: Throwable) {
+            _preview.value = _preview.value.copy(
+                isLoading = false,
+                error = t.message ?: "That project could not be opened"
+            )
+        }
+    }
+
+    /** Set when a restore replaced the crop session held by the ViewModel. */
+    @Volatile
+    var cropSessionReset = false
+        private set
+
+    /**
+     * Opens a generated file as the working image.
+     *
+     * Used for a blank canvas, which is a real image on disk rather than a
+     * flag on the state. Going through [openProject]-style loading keeps a
+     * blank project on the identical code path as a picked photo, so saving,
+     * restoring, layering and exporting all behave the same.
+     */
+    suspend fun adoptBlankSource(
+        context: android.content.Context,
+        file: File,
+        displayName: String
+    ) {
+        _preview.value = _preview.value.copy(isLoading = true, error = null)
+        try {
+            val loaded = ImageLoader.loadFromFile(context, file, displayName)
+            original?.recycle()
+            lastRenderedBitmap?.recycle()
+
+            original = loaded.bitmap
+            sourceFile = file
+            current = EditState()
+            undoStack.clear()
+            redoStack.clear()
+            projectId = null
+            projectName = displayName
+            cropSessionReset = true
+
+            _preview.value = PreviewState(
+                bitmap = loaded.bitmap,
+                original = loaded.bitmap,
+                info = loaded.info,
+                isLoading = false
+            )
+            scheduleRender()
+        } catch (t: Throwable) {
+            _preview.value = _preview.value.copy(
+                isLoading = false,
+                error = t.message ?: "Could not start a new project"
+            )
+        }
     }
 
     /** Forces a re-render, e.g. when the tool changes what it needs. */
     fun refresh() = scheduleRender()
+
+    /**
+     * Persists the current edit as a project.
+     *
+     * Called on a debounce after every state change, so a crash or an
+     * out-of-memory kill at worst loses the last few seconds of work rather
+     * than the whole edit.
+     */
+    suspend fun autosave(context: android.content.Context) {
+        val file = sourceFile ?: return
+        val state = current
+        if (state.isDefault) {
+            // Back to a pristine image: the project has nothing to hold.
+            projectId?.let { ProjectStore.delete(context, it) }
+            projectId = null
+            return
+        }
+
+        val preview = _preview.value.bitmap
+        val id = ProjectStore.save(context, projectId, file, projectName, state) ?: return
+        projectId = id
+
+        // Thumbnail once the first render lands, not on every keystroke.
+        if (preview != null && _preview.value.thumbnailMissing) {
+            ProjectStore.writeThumbnail(context, id, preview)
+            _preview.value = _preview.value.copy(thumbnailMissing = false)
+        }
+    }
+
+    suspend fun deleteProject(context: android.content.Context, id: String) {
+        ProjectStore.delete(context, id)
+        if (projectId == id) projectId = null
+    }
+
+    /** Forgets the current project without deleting it, e.g. on "new photo". */
+    fun detachProject() {
+        projectId = null
+    }
 
     /** Renders the current state at full resolution for export. */
     suspend fun renderFull(): Bitmap? = withContext(renderDispatcher) {
@@ -494,19 +967,21 @@ class EditorRepository(
         renderMutex.withLock {
             _preview.value = _preview.value.copy(isRendering = true)
 
-            val result = pipeline(base, current, previewSize = PREVIEW_EDGE)
+            val state = current
+            val result = pipeline(base, state, previewSize = PREVIEW_EDGE)
 
             // While cropping, the overlay must sit on the *uncropped* image.
             // If it drew on `result` the crop rect would be applied twice and
             // the frame would drift out of alignment with the photo.
             val cropSource = when (activeToolIsCrop) {
-                true -> geometryPreview(base, current)
+                true -> cachedGeometryPreview(base, state)
                 else -> null
             }
 
             _preview.value = _preview.value.copy(
                 bitmap = result,
                 cropBase = cropSource,
+                layers = state.layers,
                 canUndo = undoStack.isNotEmpty(),
                 canRedo = redoStack.isNotEmpty(),
                 historyIndex = undoStack.size,
@@ -534,6 +1009,28 @@ class EditorRepository(
             if (state.flipV) img = geometryEngine.flip(img, FlipAxis.VERTICAL)
             img
         }
+
+    /**
+     * Memoised [geometryPreview].
+     *
+     * The crop canvas depends only on rotation, straighten and flip — never on
+     * the crop rect itself. Dragging a crop edge therefore produced an
+     * identical canvas dozens of times per gesture, each one a full rotate /
+     * flip / allocate pass on top of the real pipeline. Caching on the
+     * geometry signature means the drag only pays for the pipeline once.
+     */
+    private suspend fun cachedGeometryPreview(base: Bitmap, state: EditState): Bitmap? {
+        val key = "${state.rotationSteps}|${state.straightenDegrees}|${state.flipH}|${state.flipV}"
+        if (key == cropCanvasKey && cropCanvas != null) return cropCanvas
+
+        val rendered = geometryPreview(base, state)
+        cropCanvasKey = key
+        cropCanvas = rendered
+        return rendered
+    }
+
+    private var cropCanvasKey: String? = null
+    private var cropCanvas: Bitmap? = null
 
     private fun downscale(src: Bitmap, maxEdge: Int): Bitmap {
         val longEdge = maxOf(src.width, src.height)
@@ -564,6 +1061,10 @@ class EditorRepository(
         state: EditState,
         previewSize: Int?
     ): Bitmap? = withContext(renderDispatcher) {
+        // Geometry, cutout, layer compositing, then the colour stages. The
+        // renderer owns the whole order; nothing is composited here, because
+        // anything added after the colour stages would escape the filter and
+        // the adjustment sliders.
         val result = renderer.render(base, state, previewSize)
 
         if (previewSize != null && result != null) {

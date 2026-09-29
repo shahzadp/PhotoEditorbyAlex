@@ -17,7 +17,8 @@ echo === CLEARING OLD CRASH LOG ===
 
 echo.
 echo === INSTALLING ===
-"%ADB%" install -r %APK%
+REM %APK% must stay quoted: the project path contains a space.
+"%ADB%" install -r "%APK%"
 echo.
 echo === LAUNCHING ===
 "%ADB%" shell am start -n com.alex.photoeditor/.MainActivity

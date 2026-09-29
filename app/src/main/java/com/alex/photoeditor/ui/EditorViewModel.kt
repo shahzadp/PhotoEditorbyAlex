@@ -12,18 +12,27 @@ import com.alex.photoeditor.core.Adjustments
 import com.alex.photoeditor.core.AdjustmentKind
 import com.alex.photoeditor.core.AspectPreset
 import com.alex.photoeditor.core.CropRect
+import com.alex.photoeditor.core.CutoutComposer
+import com.alex.photoeditor.core.CutoutState
 import com.alex.photoeditor.core.EditState
 import com.alex.photoeditor.core.EditorRepository
 import com.alex.photoeditor.core.ExportFormat
 import com.alex.photoeditor.core.ExportSettings
 import com.alex.photoeditor.core.Exporter
 import com.alex.photoeditor.core.FlipAxis
+import com.alex.photoeditor.core.ImageLayer
 import com.alex.photoeditor.core.PreviewState
+import com.alex.photoeditor.core.ProjectStore
+import com.alex.photoeditor.core.ProjectSummary
+import com.alex.photoeditor.core.TapSelectEngine
 import com.alex.photoeditor.ui.components.CropSelection
 import com.alex.photoeditor.ui.components.toCropRect
 import com.alex.photoeditor.ui.components.toSelection
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
@@ -34,13 +43,37 @@ enum class EditorTool(val label: String) {
     FILTERS("Filters"),
     CROP("Crop"),
     TRANSFORM("Transform"),
+    TAP_SELECT("Cutout"),
+    LAYERS("Add image"),
     INFO("Info")
 }
 
+/**
+ * How long editing must settle before the session is written to disk.
+ *
+ * Long enough that a continuous slider drag produces one save rather than one
+ * per frame, short enough that a crash loses well under a second of work.
+ */
+private const val AUTOSAVE_DELAY_MS = 800L
+
 class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
-    val repository = EditorRepository()
+    /**
+     * The repository is created here rather than by default construction
+     * because the MediaPipe segmenter needs the application Context.
+     */
+    val repository = EditorRepository(
+        cutoutComposer = CutoutComposer(TapSelectEngine(app))
+    )
     private val exporter = Exporter(app)
+
+    init {
+        // Autosave reacts to a single revision counter rather than to each
+        // setter, so no state-mutating path can be left out of the backup.
+        viewModelScope.launch {
+            repository.revision.drop(1).collect { scheduleAutosave() }
+        }
+    }
 
     val preview: kotlinx.coroutines.flow.StateFlow<PreviewState> = repository.preview
 
@@ -72,6 +105,122 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     var isExporting by mutableStateOf(false)
         private set
 
+    /** True while the projects sheet is showing. */
+    var showProjects by mutableStateOf(false)
+        private set
+
+    /** Saved projects, newest first. */
+    var projects by mutableStateOf<List<ProjectSummary>>(emptyList())
+        private set
+
+    var isLoadingProjects by mutableStateOf(false)
+        private set
+
+    /** True while the "new project" chooser is showing. */
+    var showNewProject by mutableStateOf(false)
+        private set
+
+    fun openNewProjectChooser() {
+        showNewProject = true
+    }
+
+    fun closeNewProject() {
+        showNewProject = false
+    }
+
+    /**
+     * Starts a blank project on a solid canvas.
+     *
+     * The colour becomes a real image file on disk rather than a flag on the
+     * state, so the project saves, restores and exports through exactly the
+     * same path as a picked photo.
+     */
+    fun startBlankProject(colour: ProjectStore.BlankColour) {
+        showNewProject = false
+        showProjects = false
+        viewModelScope.launch {
+            val file = ProjectStore.createBlank(getApplication(), colour)
+            val name = "${colour.label} canvas"
+            // Deliberately not written to the projects grid yet: a blank canvas
+            // has no edits, and autosave treats an unedited state as nothing
+            // worth keeping. The project appears once the user actually
+            // changes something, which is the behaviour they already expect
+            // from undoing back to the original.
+            repository.adoptBlankSource(getApplication(), file, name)
+        }
+    }
+
+    /**
+     * Debounced autosave.
+     *
+     * Every state change restarts a short timer rather than writing
+     * immediately, so dragging an adjustment slider does not hammer the disk
+     * with a JSON file per frame. A crash loses at most the last
+     * [AUTOSAVE_DELAY_MS] of work instead of the whole session.
+     */
+    private var autosaveJob: Job? = null
+
+    private fun scheduleAutosave() {
+        if (repository.currentState().isDefault) return
+        autosaveJob?.cancel()
+        autosaveJob = viewModelScope.launch {
+            delay(AUTOSAVE_DELAY_MS)
+            repository.autosave(getApplication())
+        }
+    }
+
+    /**
+     * Writes any pending work immediately.
+     *
+     * Called when the editor is left, so closing the app deliberately does not
+     * race the debounce timer.
+     */
+    fun flushAutosave() {
+        autosaveJob?.cancel()
+        autosaveJob = viewModelScope.launch {
+            repository.autosave(getApplication())
+        }
+    }
+
+    private suspend fun refreshProjects() {
+        isLoadingProjects = true
+        projects = ProjectStore.list(getApplication())
+        isLoadingProjects = false
+    }
+
+    fun openProjects() {
+        showProjects = true
+        viewModelScope.launch { refreshProjects() }
+    }
+
+    fun closeProjects() {
+        showProjects = false
+    }
+
+    /** Opens a saved project, replacing whatever is currently open. */
+    fun openProject(id: String) {
+        viewModelScope.launch {
+            val project = ProjectStore.load(getApplication(), id) ?: run {
+                statusMessage = "That project could not be opened"
+                refreshProjects()
+                return@launch
+            }
+            if (!ProjectStore.sourceExists(project)) {
+                statusMessage = "The original image for that project is missing"
+                return@launch
+            }
+            showProjects = false
+            repository.openProject(getApplication(), project)
+        }
+    }
+
+    fun deleteProject(id: String) {
+        viewModelScope.launch {
+            repository.deleteProject(getApplication(), id)
+            refreshProjects()
+        }
+    }
+
     private val _shareRequest = MutableStateFlow<Uri?>(null)
     val shareRequest: kotlinx.coroutines.flow.StateFlow<Uri?> = _shareRequest
 
@@ -92,11 +241,29 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { repository.open(getApplication(), uri) }
     }
 
+    /** True when an image is open, so Back should return to the picker. */
+    val hasImage: Boolean get() = preview.value.bitmap != null
+
+    /** Closes the open image and returns to the empty picker screen. */
+    fun closeImage() {
+        cropSession = null
+        showExportSheet = false
+        isComparing = false
+        // Write any debounced work out before the state is torn down, or the
+        // last few seconds of edits are lost.
+        flushAutosave()
+        repository.close()
+    }
+
     fun selectTool(tool: EditorTool) {
         activeTool = tool
-        // Tells the renderer to produce the uncropped crop canvas.
-        repository.activeToolIsCrop = (tool == EditorTool.CROP)
-        if (tool == EditorTool.CROP) {
+        // Tells the renderer to produce the uncropped geometry render. Both
+        // crop and tap-to-select need it: the crop overlay sits on it, and
+        // taps are recorded against the full uncropped frame so a later crop
+        // does not invalidate the selection.
+        val needsUncropped = tool == EditorTool.CROP || tool == EditorTool.TAP_SELECT
+        repository.activeToolIsCrop = needsUncropped
+        if (needsUncropped) {
             // Re-render so cropBase becomes available.
             repository.refresh()
         }
@@ -255,6 +422,87 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     fun undo() = repository.undo()
     fun redo() = repository.redo()
+
+    // ---------------------------------------------------------- cutout taps
+
+    /** Current background-removal selection. */
+    fun currentCutout(): CutoutState = repository.currentState().cutout
+
+    fun addTap(x: Float, y: Float) = repository.addTap(x, y)
+
+    /** Starts a fresh selection from a single tap. */
+    fun replaceTap(x: Float, y: Float) = repository.addTap(x, y, replace = true)
+
+    /**
+     * Handles a tap on the photo.
+     *
+     * A long press restarts the selection, a plain tap extends it, but the
+     * first tap of a fresh selection always replaces so the user does not have
+     * to clear before starting again.
+     */
+    fun selectAt(x: Float, y: Float, replace: Boolean) {
+        val existing = repository.currentState().cutout
+        if (replace || !existing.isActive) {
+            replaceTap(x, y)
+        } else {
+            addTap(x, y)
+        }
+    }
+
+    fun clearCutout() = repository.clearCutout()
+
+    fun setKeepSubject(keep: Boolean) = repository.setCutoutKeepSubject(keep)
+
+    fun setCutoutThreshold(v: Float) = repository.setCutoutThreshold(v)
+
+    fun setCutoutFeather(v: Float) = repository.setCutoutFeather(v)
+
+    // --------------------------------------------------------- image layers
+
+    /** Which layer the panel is editing, or null when the stack is empty. */
+    var activeLayerId by mutableStateOf<String?>(null)
+        private set
+
+    /**
+     * The layer currently selected for editing, or null.
+     *
+     * Callers pass [ImageLayer] down as a composable parameter rather than
+     * calling an accessor here. Reading `preview.value` inside a composable
+     * does not register a snapshot read, so the UI silently stopped
+     * recomposing; taking the stack from the collected state in
+     * `EditorScreen` and passing it in is what makes the controls live.
+     */
+    fun setActiveLayer(id: String?) {
+        activeLayerId = id
+    }
+
+    fun addLayer(uri: Uri) {
+        viewModelScope.launch {
+            repository.addLayer(getApplication(), uri)
+            // Select whatever was just added so its transform is editable.
+            activeLayerId = repository.currentLayers().lastOrNull()?.id
+        }
+    }
+
+    fun selectLayer(id: String) {
+        activeLayerId = id
+    }
+
+    fun setLayerScale(id: String, v: Float) = repository.setLayerScale(id, v)
+    fun setLayerOffset(id: String, x: Float, y: Float) = repository.setLayerOffset(id, x, y)
+    fun setLayerRotation(id: String, d: Float) = repository.setLayerRotation(id, d)
+    fun setLayerOpacity(id: String, v: Float) = repository.setLayerOpacity(id, v)
+    fun setLayerVisible(id: String, v: Boolean) = repository.setLayerVisible(id, v)
+    fun resetLayer(id: String) = repository.resetLayer(id)
+    fun removeLayer(id: String) {
+        repository.removeLayer(id)
+        if (activeLayerId == id) {
+            activeLayerId = repository.currentLayers().lastOrNull()?.id
+        }
+    }
+
+    fun bringLayerToFront(id: String) = repository.bringLayerToFront(id)
+    fun sendLayerToBack(id: String) = repository.sendLayerToBack(id)
 
     fun currentAdjustments(): Adjustments = repository.currentState().adjustments
 

@@ -33,21 +33,30 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.alex.photoeditor.R
 import com.alex.photoeditor.ui.EditorTool
 import com.alex.photoeditor.ui.EditorViewModel
+import com.alex.photoeditor.ui.rememberSafeArea
 import com.alex.photoeditor.ui.components.AdjustPanel
 import com.alex.photoeditor.ui.components.CropStage
 import com.alex.photoeditor.ui.components.pressAndHold
 import com.alex.photoeditor.ui.components.ExportSheet
 import com.alex.photoeditor.ui.components.FilterPanel
 import com.alex.photoeditor.ui.components.InfoPanel
+import com.alex.photoeditor.ui.components.LayerGestureStage
+import com.alex.photoeditor.ui.components.LayersPanel
+import com.alex.photoeditor.ui.components.NewProjectSheet
+import com.alex.photoeditor.ui.components.ProjectsSheet
+import com.alex.photoeditor.ui.components.TapSelectPanel
 import com.alex.photoeditor.ui.components.ToolRail
 import com.alex.photoeditor.ui.components.TransformPanel
 import com.alex.photoeditor.ui.theme.Surface1
@@ -55,19 +64,34 @@ import com.alex.photoeditor.ui.theme.Surface1
 @Composable
 fun EditorScreen(
     vm: EditorViewModel,
-    onPickImage: () -> Unit
+    onPickImage: () -> Unit,
+    onPickLayer: () -> Unit = {}
 ) {
     val state by vm.preview.collectAsStateWithLifecycle()
+
+    // The window is edge-to-edge, so the notch and the navigation bar overlap
+    // the content unless the safe area is applied here.
+    val safeArea = rememberSafeArea()
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
+            .padding(
+                top = safeArea.top,
+                bottom = safeArea.bottom,
+                start = safeArea.start,
+                end = safeArea.end
+            )
     ) {
         when {
             state.error != null -> ErrorState(state.error!!, onPickImage)
-            state.bitmap == null -> EmptyState(onPickImage)
-            else -> EditorContent(vm = vm, state = state)
+            state.bitmap == null -> EmptyState(onPickImage, vm::openProjects)
+            else -> EditorContent(
+                vm = vm,
+                state = state,
+                onPickLayer = onPickLayer
+            )
         }
 
         if (state.isLoading) {
@@ -85,12 +109,22 @@ fun EditorScreen(
     if (vm.showExportSheet) {
         ExportSheet(vm = vm)
     }
+
+    if (vm.showProjects) {
+        ProjectsSheet(vm = vm)
+    }
+
+    // Drawn after the projects sheet so the chooser sits on top of it.
+    if (vm.showNewProject) {
+        NewProjectSheet(vm = vm, onPickImage = onPickImage)
+    }
 }
 
 @Composable
 private fun EditorContent(
     vm: EditorViewModel,
-    state: com.alex.photoeditor.core.PreviewState
+    state: com.alex.photoeditor.core.PreviewState,
+    onPickLayer: () -> Unit
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
 
@@ -105,6 +139,17 @@ private fun EditorContent(
         ) {
             // Press-and-hold compares against the untouched original.
             val isCropMode = vm.activeTool == EditorTool.CROP
+            val isLayerMode = vm.activeTool == EditorTool.LAYERS
+
+            // The layer stack is taken from the *collected* state, not from
+            // vm.currentLayers(). Reading a StateFlow's value directly does not
+            // register a snapshot read, so a composable that did so only ever
+            // recomposed when some unrelated Compose state changed - which is
+            // why the eye and delete controls appeared to need the tool
+            // reopening before they showed anything.
+            val activeLayer = state.layers.firstOrNull { it.id == vm.activeLayerId }
+                ?: state.layers.lastOrNull()
+
             val shown = when {
                 vm.isComparing -> state.original
                 // Cropping draws on the uncropped geometry render so the crop
@@ -121,6 +166,14 @@ private fun EditorContent(
                         initial = vm.activeCropSelection(),
                         onPreviewChange = vm::updateCrop,
                         onCommit = vm::commitCrop
+                    )
+                } else if (isLayerMode && activeLayer != null) {
+                    // The stacked image is dragged and pinched directly on the
+                    // photo, so the gesture stage takes over the preview.
+                    LayerGestureStage(
+                        bitmap = bmp,
+                        layer = activeLayer,
+                        vm = vm
                     )
                 } else {
                     Image(
@@ -158,6 +211,16 @@ private fun EditorContent(
             EditorTool.FILTERS -> FilterPanel(vm)
             EditorTool.CROP -> TransformPanel(vm, cropMode = true)
             EditorTool.TRANSFORM -> TransformPanel(vm, cropMode = false)
+            // The tap targets the fully rendered image, including any cutout,
+            // so the user sees the selection as they make it. Using the
+            // geometry-only render here meant the stage showed an uncut photo
+            // and the removal only appeared after switching tools.
+            EditorTool.TAP_SELECT -> TapSelectPanel(vm, state.bitmap)
+            EditorTool.LAYERS -> LayersPanel(
+                vm = vm,
+                layers = state.layers,
+                onPickLayer = onPickLayer
+            )
             EditorTool.INFO -> InfoPanel(state.info)
         }
     }
@@ -178,10 +241,17 @@ private fun TopBar(
         verticalAlignment = Alignment.CenterVertically
     ) {
         IconButton(
-            onClick = { vm.resetAll() },
-            modifier = Modifier.semantics { contentDescription = "Revert all edits" }
+            // Matches the system Back button: step out of the editor rather
+            // than wiping every edit. Reverting is already covered by undo, and
+            // a lone back arrow silently destroying the edit was surprising.
+            onClick = { vm.closeImage() },
+            modifier = Modifier.semantics { contentDescription = "Close photo" }
         ) {
-            Icon(Icons.AutoMirrored.Filled.ArrowBack, "Revert", tint = MaterialTheme.colorScheme.onSurface)
+            Icon(
+                Icons.AutoMirrored.Filled.ArrowBack,
+                "Close",
+                tint = MaterialTheme.colorScheme.onSurface
+            )
         }
 
         IconButton(
@@ -251,7 +321,7 @@ private fun TopBar(
 }
 
 @Composable
-private fun EmptyState(onPickImage: () -> Unit) {
+private fun EmptyState(onPickImage: () -> Unit, onOpenProjects: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -259,14 +329,24 @@ private fun EmptyState(onPickImage: () -> Unit) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Icon(
-            Icons.Filled.Tune,
+        // The real app mark rather than a generic sliders glyph, so the first
+        // screen is already recognisably the app. This is a flattened vector
+        // rather than R.mipmap.ic_launcher: the launcher icon is an adaptive-
+        // icon XML, which painterResource cannot load.
+        Image(
+            painter = painterResource(id = R.drawable.ic_brand),
             contentDescription = null,
-            tint = MaterialTheme.colorScheme.primary,
-            modifier = Modifier.size(64.dp)
+            modifier = Modifier.size(96.dp)
         )
-        Spacer(Modifier.height(16.dp))
-        Text("Offline Photo Editor", style = MaterialTheme.typography.titleLarge)
+        Spacer(Modifier.height(20.dp))
+        Text(
+            "Offline Photo Editor",
+            style = MaterialTheme.typography.titleLarge,
+            // Explicitly on-surface rather than the default: the title sits on
+            // the near-black background, where the inherited colour from the
+            // picker surface read as grey and looked disabled.
+            color = Color.White
+        )
         Spacer(Modifier.height(8.dp))
         Text(
             "Choose a photo to start editing. Everything stays on this device.",
@@ -278,6 +358,17 @@ private fun EmptyState(onPickImage: () -> Unit) {
         androidx.compose.material3.Button(onClick = onPickImage) {
             Text("Open photo")
         }
+        Spacer(Modifier.height(10.dp))
+        androidx.compose.material3.OutlinedButton(onClick = onOpenProjects) {
+            Text("Projects")
+        }
+        Spacer(Modifier.height(10.dp))
+        Text(
+            "Edits save automatically, so nothing is lost if you close the app.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
     }
 }
 

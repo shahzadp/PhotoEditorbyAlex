@@ -3,6 +3,7 @@ package com.alex.photoeditor.core
 import android.graphics.Bitmap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
 import kotlin.math.pow
 import kotlin.math.roundToInt
 
@@ -12,6 +13,7 @@ import kotlin.math.roundToInt
  * `x` is input luminance (0..1) and `y` is output luminance (0..1), matching
  * how Photoshop and Lightroom present curve editors.
  */
+@Serializable
 data class CurvePoint(val x: Float, val y: Float)
 
 /**
@@ -19,6 +21,7 @@ data class CurvePoint(val x: Float, val y: Float)
  * [com.alex.photoeditor.core.EditState] as normalised point lists so they
  * remain serialisable and non-destructive.
  */
+@Serializable
 data class ToneCurve(
     val channel: CurveChannel,
     val points: List<CurvePoint>
@@ -150,6 +153,7 @@ object CurveEditor {
     }
 }
 
+@Serializable
 enum class CurveChannel(val label: String) {
     RED("Red"),
     GREEN("Green"),
@@ -157,6 +161,7 @@ enum class CurveChannel(val label: String) {
 }
 
 /** Black/white/gamma input mapping, the "Levels" equivalent. */
+@Serializable
 data class Levels(
     val blackPoint: Float = 0f,
     val whitePoint: Float = 1f,
@@ -172,6 +177,7 @@ data class Levels(
  * Values are normalised: hue in [-1, 1] where 1 is a full 360 degree rotation,
  * saturation/lightness in [-1, 1].
  */
+@Serializable
 data class HslAdjustments(
     val hue: Float = 0f,
     val saturation: Float = 0f,
@@ -187,6 +193,7 @@ data class HslAdjustments(
  * This is Photoshop's "Selective Color", implemented per RGB channel with a
  * tolerance falloff, which covers the majority of practical corrections.
  */
+@Serializable
 data class SelectiveColor(
     val red: RgbCorrection = RgbCorrection(),
     val green: RgbCorrection = RgbCorrection(),
@@ -195,6 +202,7 @@ data class SelectiveColor(
 )
 
 /** Per-RGB-channel correction. Values in [-1, 1]. */
+@Serializable
 data class RgbCorrection(
     val cyan: Float = 0f,
     val magenta: Float = 0f,
@@ -211,6 +219,7 @@ data class RgbCorrection(
  * Kept separate from the Phase 1 [Adjustments] so the two can evolve
  * independently, and folded into the same non-destructive pipeline.
  */
+@Serializable
 data class ColorGrade(
     val curves: Map<CurveChannel, ToneCurve> = emptyMap(),
     val levels: Map<CurveChannel, Levels> = emptyMap(),

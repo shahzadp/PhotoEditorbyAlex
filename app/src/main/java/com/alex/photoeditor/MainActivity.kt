@@ -4,6 +4,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -45,9 +46,34 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Picks an image to stack as a layer.
+     *
+     * Separate from the base-image picker so the two flows do not fight over
+     * the same pending state.
+     */
+    private val pickLayer = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            runCatching {
+                contentResolver.takePersistableUriPermission(
+                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+            currentViewModel?.addLayer(uri)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        // The activity's own dispatcher, not a new instance: a throwaway
+        // dispatcher is never consulted by the system.
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() = handleBack()
+        })
 
         pendingUri = extractImageUri(intent)
 
@@ -56,6 +82,10 @@ class MainActivity : ComponentActivity() {
                 val vm: EditorViewModel = viewModel()
                 val context = LocalContext.current
                 val shareUri by vm.shareRequest.collectAsStateWithLifecycle()
+
+                // Expose the ViewModel to onBackPressed, which runs outside
+                // the composition.
+                currentViewModel = vm
 
                 LaunchedEffect(pendingUri) {
                     pendingUri?.let {
@@ -81,7 +111,8 @@ class MainActivity : ComponentActivity() {
 
                 EditorScreen(
                     vm = vm,
-                    onPickImage = { pickImage.launch(arrayOf("image/*")) }
+                    onPickImage = { pickImage.launch(arrayOf("image/*")) },
+                    onPickLayer = { pickLayer.launch(arrayOf("image/*")) }
                 )
             }
         }
@@ -91,6 +122,41 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         extractImageUri(intent)?.let { pendingUri = it }
     }
+
+    /**
+     * Routes the system Back gesture.
+     *
+     * Without this the activity was a leaf: Back exited the app outright even
+     * with the export sheet open or a photo loaded, which read as "the back
+     * button does not work". Back now closes the sheet first, then returns to
+     * the picker if an image is open, and only leaves the app from there.
+     *
+     * Uses the modern callback rather than the overridden `onBackPressed`,
+     * which Android 13+ ignores once an activity opts into predictive back.
+     */
+    private fun handleBack() {
+        val vm = currentViewModel
+        if (vm == null) {
+            finish()
+            return
+        }
+        when {
+            // The export sheet is a modal layer, so Back should dismiss it
+            // rather than doing anything to the edit.
+            vm.showExportSheet -> vm.closeExportSheet()
+
+            // An image is open: step back to the empty picker screen.
+            vm.hasImage -> vm.closeImage()
+
+            else -> finish()
+        }
+    }
+
+    /**
+     * The ViewModel lives inside `setContent`, so it is captured here for the
+     * back callback to reach. Null until the composition has run once.
+     */
+    private var currentViewModel: EditorViewModel? = null
 
     /** Pulls an image out of a SEND, EDIT or VIEW intent. */
     private fun extractImageUri(intent: Intent?): Uri? {

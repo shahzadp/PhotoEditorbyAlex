@@ -43,3 +43,14 @@ Thumbs.db
 
 # Local build output logs.
 build-log.txt
+
+# Ad-hoc throwaway scripts used while debugging on a device. These are
+# scratch, not part of the project; the real build/deploy helpers are
+# tracked deliberately.
+layertest.bat
+singletap.bat
+backtest.bat
+git-status.bat
+assets-check.bat
+inspect*.ps1
+taptest.ps1

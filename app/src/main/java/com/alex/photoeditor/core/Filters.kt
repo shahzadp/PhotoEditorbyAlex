@@ -177,6 +177,9 @@ class FilterEngine {
         if (filter.id == "original") return
         val s = filter.settings
 
+        // Neighbourhood effects genuinely need somewhere to read from while
+        // they write, so they use one reusable buffer. Everything after them is
+        // a pure per-pixel map and is fused into a single in-place pass.
         if (s.pixelate > 0f) {
             copyBack(px, pixelate(px, width, height, s.pixelate))
         }
@@ -187,14 +190,157 @@ class FilterEngine {
             copyBack(px, halation(px, width, height, s.halation))
         }
 
-        // colorPass and tonalPass allocate their own output; fold each result
-        // straight back in to keep the caller's buffer authoritative.
-        copyBack(px, colorPass(px, s))
-        copyBack(px, tonalPass(px, s))
-
-        if (s.grain > 0f) copyBack(px, grain(px, s.grain))
-        if (s.vignette > 0f) copyBack(px, vignette(px, width, height, s.vignette))
+        colorTonalGrainVignette(px, width, height, s)
     }
+
+    /**
+     * Colour, tone, grain and vignette in one pass.
+     *
+     * These were four separate functions, each allocating a full-size
+     * [IntArray] and each walking every pixel. On a 1440px preview that is four
+     * ~8 MB allocations and four full memory sweeps per frame, which is the
+     * bulk of the lag when dragging a filter.
+     *
+     * All four are per-pixel functions with no neighbourhood reads, applied in
+     * this exact order, so fusing them into a single loop is arithmetically
+     * identical to running them back to back — with one allocation-free pass.
+     */
+    private fun colorTonalGrainVignette(
+        px: IntArray,
+        width: Int,
+        height: Int,
+        s: FilterSettings
+    ) {
+        val fadeLift = s.fade * 0.22f
+        val hasTonal = s.contrast != 1f || s.brightness != 0f || fadeLift > 0f
+        val hasGrain = s.grain > 0f
+        val hasVignette = s.vignette > 0f
+        if (!hasTonal && !hasGrain && !hasVignette && s.monochromeMix <= 0f &&
+            s.saturation == 1f && s.temperature == 0f && s.tint == 0f &&
+            s.crossProcess <= 0f && s.splitShadow <= 0f && s.splitHighlight <= 0f &&
+            s.duotoneStrength <= 0f && s.posterize <= 0f && s.solarize <= 0f
+        ) return
+
+        val grainStrength = s.grain * 0.25f
+        val cx = width / 2f
+        val cy = height / 2f
+        val maxDist = sqrt(cx * cx + cy * cy)
+
+        // Deterministic PRNG keeps previews stable frame to frame.
+        var seed = 0x5DEECE66DL
+
+        for (i in px.indices) {
+            val c = px[i]
+            // Carry the source alpha through untouched. Hardcoding an opaque
+            // alpha here is what made applying any filter wipe out a cutout:
+            // the background the user had just made transparent came back as a
+            // solid rectangle.
+            val alpha = c and ALPHA_MASK
+            var r = ((c shr 16) and 0xFF) * INV255
+            var g = ((c shr 8) and 0xFF) * INV255
+            var b = (c and 0xFF) * INV255
+
+            // ---- colour pass
+            if (s.monochromeMix > 0f) {
+                val l = 0.2126f * r + 0.7152f * g + 0.0722f * b
+                val k = s.monochromeMix
+                r += (l - r) * k
+                g += (l - g) * k
+                b += (l - b) * k
+            }
+            if (s.saturation != 1f) {
+                val l = 0.2126f * r + 0.7152f * g + 0.0722f * b
+                r = l + (r - l) * s.saturation
+                g = l + (g - l) * s.saturation
+                b = l + (b - l) * s.saturation
+            }
+            if (s.temperature != 0f) {
+                r += s.temperature * 0.12f
+                b -= s.temperature * 0.12f
+            }
+            if (s.tint != 0f) {
+                g += s.tint * 0.08f
+                r -= s.tint * 0.03f
+                b -= s.tint * 0.03f
+            }
+            if (s.crossProcess > 0f) {
+                val k = s.crossProcess
+                r = r * (1f + k * 0.15f)
+                b = b * (1f - k * 0.10f)
+                val l = 0.2126f * r + 0.7152f * g + 0.0722f * b
+                r = l + (r - l) * (1f + k * 0.2f)
+                g = l + (g - l) * (1f - k * 0.15f)
+            }
+            if (s.splitShadow > 0f || s.splitHighlight > 0f) {
+                val l = 0.2126f * r + 0.7152f * g + 0.0722f * b
+                val shW = (1f - smoothStep(0f, 1f, l)) * s.splitShadow
+                val hiW = smoothStep(0f, 1f, l) * s.splitHighlight
+                if (shW > 0f) {
+                    val t = unpack(s.shadowTint)
+                    r += t.first * shW; g += t.second * shW; b += t.third * shW
+                }
+                if (hiW > 0f) {
+                    val t = unpack(s.highlightTint)
+                    r += t.first * hiW; g += t.second * hiW; b += t.third * hiW
+                }
+            }
+            if (s.duotoneStrength > 0f) {
+                val l = (0.2126f * r + 0.7152f * g + 0.0722f * b).coerceIn(0f, 1f)
+                val sh = unpack(s.duotoneShadow)
+                val hi = unpack(s.duotoneHighlight)
+                r = lerp(r, sh.first + (hi.first - sh.first) * l, s.duotoneStrength)
+                g = lerp(g, sh.second + (hi.second - sh.second) * l, s.duotoneStrength)
+                b = lerp(b, sh.third + (hi.third - sh.third) * l, s.duotoneStrength)
+            }
+            if (s.posterize > 0f) {
+                val levels = (s.posterize.coerceIn(2f, 32f) - 1f).roundToInt()
+                r = (r * levels).roundToInt() / levels.toFloat()
+                g = (g * levels).roundToInt() / levels.toFloat()
+                b = (b * levels).roundToInt() / levels.toFloat()
+            }
+            if (s.solarize > 0f) {
+                val t = s.solarize
+                r = solarize(r, t); g = solarize(g, t); b = solarize(b, t)
+            }
+
+            // ---- tonal pass
+            if (hasTonal) {
+                r += s.brightness; g += s.brightness; b += s.brightness
+                if (s.contrast != 1f) {
+                    val k = s.contrast
+                    r = (r - 0.5f) * k + 0.5f
+                    g = (g - 0.5f) * k + 0.5f
+                    b = (b - 0.5f) * k + 0.5f
+                }
+                if (fadeLift > 0f) {
+                    r += (0.5f - r) * fadeLift
+                    g += (0.5f - g) * fadeLift
+                    b += (0.5f - b) * fadeLift
+                }
+            }
+
+            if (hasVignette) {
+                val x = i % width
+                val y = i / width
+                val dx = x - cx
+                val dy = y - cy
+                val d = sqrt(dx * dx + dy * dy) / maxDist
+                val falloff = (d * d * s.vignette).coerceIn(0f, 0.9f)
+                r *= (1f - falloff); g *= (1f - falloff); b *= (1f - falloff)
+            }
+
+            if (hasGrain) {
+                seed = (seed * 0x5DEECE66DL + 0xBL) and ((1L shl 48) - 1)
+                val n = ((seed shr 16).toInt() and 0xFF) / 255f - 0.5f
+                r += n * grainStrength; g += n * grainStrength; b += n * grainStrength
+            }
+
+            px[i] = alpha or (to255(r) shl 16) or (to255(g) shl 8) or to255(b)
+        }
+    }
+
+    private fun solarize(v: Float, t: Float): Float =
+        if (v > 0.5f) v - (v - 0.5f) * 2f * t else v + (0.5f - v) * 2f * t
 
     private fun copyBack(dst: IntArray, src: IntArray) {
         if (src !== dst) System.arraycopy(src, 0, dst, 0, dst.size)
@@ -393,6 +539,7 @@ class FilterEngine {
         for (i in px.indices) {
             val c = px[i]
             val b = blurred[i]
+            val alpha = c and ALPHA_MASK
             // screen blend of the blurred highlights back over the original
             val br = ((c shr 16) and 0xFF) * INV255
             val bg = ((c shr 8) and 0xFF) * INV255
@@ -400,7 +547,7 @@ class FilterEngine {
             val hr = ((b shr 16) and 0xFF) * INV255
             val hg = ((b shr 8) and 0xFF) * INV255
             val hb = (b and 0xFF) * INV255
-            out[i] = OPAQUE or
+            out[i] = alpha or
                 (to255(screen(br, hr * amount)) shl 16) or
                 (to255(screen(bg, hg * amount)) shl 8) or
                 to255(screen(bb, hb * amount))
@@ -419,7 +566,7 @@ class FilterEngine {
             val hg = max(0f, ((b shr 8) and 0xFF) * INV255 - 0.55f) * 2f
             val hb = max(0f, (b and 0xFF) * INV255 - 0.55f) * 2f
             val k = amount
-            out[i] = OPAQUE or
+            out[i] = (c and ALPHA_MASK) or
                 (to255(((c shr 16) and 0xFF) * INV255 + hr * k) shl 16) or
                 (to255(((c shr 8) and 0xFF) * INV255 + hg * k * 0.6f) shl 8) or
                 to255((c and 0xFF) * INV255 + hb * k * 0.3f)
@@ -470,7 +617,7 @@ class FilterEngine {
             seed = (seed * 0x5DEECE66DL + 0xBL) and ((1L shl 48) - 1)
             val n = ((seed shr 16).toInt() and 0xFF) / 255f - 0.5f
             val c = px[i]
-            out[i] = OPAQUE or
+            out[i] = (c and ALPHA_MASK) or
                 (to255(((c shr 16) and 0xFF) * INV255 + n * strength) shl 16) or
                 (to255(((c shr 8) and 0xFF) * INV255 + n * strength) shl 8) or
                 to255((c and 0xFF) * INV255 + n * strength)
@@ -490,7 +637,7 @@ class FilterEngine {
                 val d = sqrt(dx * dx + dy * dy) / maxDist
                 val falloff = (d * d * amount).coerceIn(0f, 0.9f)
                 val c = px[y * w + x]
-                out[y * w + x] = OPAQUE or
+                out[y * w + x] = (c and ALPHA_MASK) or
                     (to255(((c shr 16) and 0xFF) * INV255 * (1f - falloff)) shl 16) or
                     (to255(((c shr 8) and 0xFF) * INV255 * (1f - falloff)) shl 8) or
                     to255((c and 0xFF) * INV255 * (1f - falloff))
@@ -522,5 +669,6 @@ class FilterEngine {
     private companion object {
         const val INV255 = 1f / 255f
         const val OPAQUE = 0xFF shl 24
+        const val ALPHA_MASK = 0xFF shl 24
     }
 }

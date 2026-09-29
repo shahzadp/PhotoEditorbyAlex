@@ -9,11 +9,13 @@ import android.graphics.Rect
 import android.graphics.RectF
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
 /** A crop rectangle in source-image pixel coordinates. */
+@Serializable
 data class CropRect(
     val left: Int,
     val top: Int,

@@ -35,11 +35,29 @@ class PipelineRenderer(
     private val adjustmentEngine: AdjustmentEngine = AdjustmentEngine(),
     private val filterEngine: FilterEngine = FilterEngine(),
     private val geometryEngine: GeometryEngine = GeometryEngine(),
-    private val colorGradeEngine: ColorGradeEngine = ColorGradeEngine()
+    private val colorGradeEngine: ColorGradeEngine = ColorGradeEngine(),
+    /** Optional; when absent the "tap to select" tool is disabled. */
+    private val cutoutComposer: CutoutComposer? = null,
+    /**
+     * Supplies layer bitmaps.
+     *
+     * Declared as a lookup rather than the concrete [LayerStore] so the
+     * renderer stays free of caching concerns and can be exercised without one.
+     */
+    private val layerBitmaps: ((ImageLayer) -> Bitmap?)? = null
 ) {
 
     /** Reused across renders so slider drags do not churn the heap. */
     private var scratch: IntArray = IntArray(0)
+
+    /**
+     * Separate buffer for the cutout pass.
+     *
+     * The cutout resolves into its own bitmap before the layers are stacked,
+     * while `scratch` is still holding the colour stage's working copy from a
+     * previous frame, so the two cannot share one array.
+     */
+    private var cutoutScratch: IntArray = IntArray(0)
 
     /**
      * Renders [base] according to [state].
@@ -88,14 +106,17 @@ class PipelineRenderer(
         val resizeW = state.resizeWidth
         val resizeH = state.resizeHeight
         val resizing = resizeW != null && resizeH != null
+        val cuttingOut = state.cutout.isActive
+        val hasLayers = state.layers.any { it.visible && it.opacity > 0f }
 
-        // If nothing will change a single pixel, hand back the geometry result
-        // as-is and skip the buffer work entirely.
-        val needsPixelWork = state.filterId != "original" ||
+        // Whether any stage will touch a pixel at all. The cutout is excluded
+        // because it is resolved into its own bitmap below, before the layers
+        // are stacked, rather than in the shared buffer.
+        val needsColourWork = state.filterId != "original" ||
             !state.adjustments.isNeutral ||
             !state.colorGrade.isNeutral
 
-        if (!needsPixelWork && crop == null && !resizing) {
+        if (!needsColourWork && !cuttingOut && crop == null && !resizing && !hasLayers) {
             return@withContext img
         }
 
@@ -106,14 +127,43 @@ class PipelineRenderer(
             img = geometryEngine.resize(img, resizeW, resizeH)
         }
 
+        // ---- cutout, then stack the layers, then the colour stages
+        //
+        // Order matters twice over:
+        //
+        // 1. The cutout mask is anchored to the *base* photo - the user tapped
+        //    an object on it - so it has to be resolved before any layer is
+        //    drawn. Compositing first would let the mask punch transparent
+        //    holes straight through the stacked images.
+        //
+        // 2. The layers go in *before* the colour stages. Compositing after
+        //    them, as this used to, meant a filter or an exposure slider only
+        //    ever touched the base photo and every stacked image stayed raw,
+        //    so adding a photo visibly broke the look of the edit.
+        //
+        // Layer *opacity* is honoured at draw time, so a half-transparent layer
+        // blends with what is beneath it before grading, rather than being
+        // graded independently and then blended.
+        if (cuttingOut) {
+            img = applyCutout(img, state.cutout)
+        }
+
+        if (hasLayers && layerBitmaps != null) {
+            img = LayerComposer.compose(img, state.layers, layerBitmaps)
+        }
+
+        if (!needsColourWork) {
+            return@withContext img
+        }
+
         // ---- single shared buffer for every pixel stage
         val needed = img.width * img.height
         if (scratch.size < needed) scratch = IntArray(needed)
         val px = scratch
         img.getPixels(px, 0, img.width, 0, 0, img.width, img.height)
 
-        // Run stages in place, in a fixed order so results are deterministic:
-        // filter -> colour grade -> tonal adjustments.
+        // Colour stages run in place, in a fixed order so results are
+        // deterministic: filter -> colour grade -> tonal adjustments.
         FilterLibrary.byId[state.filterId]?.let { filter ->
             if (filter.id != "original") filterEngine.applyToPixels(px, img.width, img.height, filter)
         }
@@ -135,6 +185,30 @@ class PipelineRenderer(
         val out = Bitmap.createBitmap(img.width, img.height, Bitmap.Config.ARGB_8888)
         out.setPixels(px, 0, img.width, 0, 0, img.width, img.height)
         out
+    }
+
+    /**
+     * Resolves the cutout into its own bitmap.
+     *
+     * Kept separate from the shared pixel buffer because the result has to
+     * exist as a bitmap *before* the layers are stacked on top of it, whereas
+     * the colour stages all run in place afterwards.
+     */
+    private suspend fun applyCutout(img: Bitmap, state: CutoutState): Bitmap {
+        val composer = cutoutComposer ?: return img
+        val w = img.width
+        val h = img.height
+
+        val needed = w * h
+        if (cutoutScratch.size < needed) cutoutScratch = IntArray(needed)
+        val px = cutoutScratch
+        img.getPixels(px, 0, w, 0, 0, w, h)
+
+        composer.applyToPixels(px, w, h, state)
+
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        out.setPixels(px, 0, w, 0, 0, w, h)
+        return out
     }
 
     private fun downscale(src: Bitmap, maxEdge: Int): Bitmap {
@@ -165,5 +239,6 @@ class PipelineRenderer(
     /** Drops the pixel scratch buffer; called when an image is closed. */
     fun release() {
         scratch = IntArray(0)
+        cutoutScratch = IntArray(0)
     }
 }

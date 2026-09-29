@@ -12,9 +12,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /** Output container formats supported by the exporter. */
 enum class ExportFormat(
@@ -50,16 +47,15 @@ class Exporter(private val context: Context) {
         settings: ExportSettings
     ): Uri? = withContext(Dispatchers.IO) {
         val scaled = settings.maxDimension?.let { scaleToFit(bitmap, it) } ?: bitmap
-        val bytes = encode(scaled, settings) ?: return@withContext null
-
         val name = buildFileName(settings)
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            saveViaMediaStore(name, bytes, settings)
-        } else {
-            saveLegacy(name, bytes)
-        }.also { _ ->
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                saveViaMediaStore(name, scaled, settings)
+            } else {
+                saveLegacy(name, scaled, settings)
+            }
+        } finally {
             if (scaled !== bitmap) scaled.recycle()
         }
     }
@@ -70,18 +66,17 @@ class Exporter(private val context: Context) {
             val dir = File(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES), "exports")
             if (!dir.exists()) dir.mkdirs()
             val file = File(dir, buildFileName(settings))
-            val bytes = encode(bitmap, settings) ?: return@withContext null
-            FileOutputStream(file).use { it.write(bytes) }
-            file
+            val ok = FileOutputStream(file).use { compress(bitmap, settings, it) }
+            if (ok) file else null
         }
 
     /** Encodes to a temp file and returns a shareable content:// Uri. */
     suspend fun createShareUri(bitmap: Bitmap, settings: ExportSettings): Uri? =
         withContext(Dispatchers.IO) {
-            val bytes = encode(bitmap, settings) ?: return@withContext null
             val dir = File(context.cacheDir, "share").apply { mkdirs() }
             val file = File(dir, buildFileName(settings))
-            FileOutputStream(file).use { it.write(bytes) }
+            val ok = FileOutputStream(file).use { compress(bitmap, settings, it) }
+            if (!ok) return@withContext null
 
             val authority = "${context.packageName}.fileprovider"
             androidx.core.content.FileProvider.getUriForFile(context, authority, file)
@@ -101,7 +96,7 @@ class Exporter(private val context: Context) {
 
     private fun saveViaMediaStore(
         name: String,
-        bytes: ByteArray,
+        bitmap: Bitmap,
         settings: ExportSettings
     ): Uri? {
         val resolver = context.contentResolver
@@ -119,8 +114,19 @@ class Exporter(private val context: Context) {
         val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
             ?: return null
 
-        resolver.openOutputStream(uri)?.use { it.write(bytes) }
-            ?: return null
+        // Encode straight into the resolver's stream. Building a ByteArray
+        // first meant holding the whole encoded image in memory and copying it
+        // in one more go, which for a large PNG was tens of megabytes of extra
+        // work and allocation.
+        val written = resolver.openOutputStream(uri)?.use {
+            compress(bitmap, settings, it)
+        } ?: false
+
+        if (!written) {
+            // Do not leave a zero-byte pending row behind.
+            runCatching { resolver.delete(uri, null, null) }
+            return null
+        }
 
         values.clear()
         values.put(MediaStore.Images.Media.IS_PENDING, 0)
@@ -129,13 +135,14 @@ class Exporter(private val context: Context) {
     }
 
     @Suppress("DEPRECATION")
-    private fun saveLegacy(name: String, bytes: ByteArray): Uri? {
+    private fun saveLegacy(name: String, bitmap: Bitmap, settings: ExportSettings): Uri? {
         val dir = Environment.getExternalStoragePublicDirectory(
             Environment.DIRECTORY_PICTURES
         )
         if (!dir.exists()) dir.mkdirs()
         val file = File(dir, name)
-        FileOutputStream(file).use { it.write(bytes) }
+        val written = FileOutputStream(file).use { compress(bitmap, settings, it) }
+        if (!written) return null
 
         // Make it visible to the gallery immediately.
         MediaStore.Images.Media.insertImage(
@@ -144,21 +151,29 @@ class Exporter(private val context: Context) {
         return Uri.fromFile(file)
     }
 
-    private fun encode(bitmap: Bitmap, settings: ExportSettings): ByteArray? {
-        val stream = java.io.ByteArrayOutputStream()
+    /**
+     * Compresses [bitmap] directly into [out].
+     *
+     * Returning the success flag rather than a byte array keeps the encoded
+     * payload out of the heap entirely on the gallery and share paths.
+     */
+    private fun compress(
+        bitmap: Bitmap,
+        settings: ExportSettings,
+        out: java.io.OutputStream
+    ): Boolean {
         val quality = settings.quality.coerceIn(1, 100)
-        val ok = when (settings.format) {
-            ExportFormat.JPEG -> bitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream)
-            ExportFormat.PNG -> bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
+        return when (settings.format) {
+            ExportFormat.JPEG -> bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)
+            ExportFormat.PNG -> bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
             ExportFormat.WEBP ->
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    bitmap.compress(Bitmap.CompressFormat.WEBP_LOSSY, quality, stream)
+                    bitmap.compress(Bitmap.CompressFormat.WEBP_LOSSY, quality, out)
                 } else {
                     @Suppress("DEPRECATION")
-                    bitmap.compress(Bitmap.CompressFormat.WEBP, quality, stream)
+                    bitmap.compress(Bitmap.CompressFormat.WEBP, quality, out)
                 }
         }
-        return if (ok) stream.toByteArray() else null
     }
 
     private fun scaleToFit(bitmap: Bitmap, maxEdge: Int): Bitmap {

@@ -16,7 +16,14 @@ import kotlin.math.min
 /** Result of loading a user-picked image. */
 data class LoadedImage(
     val bitmap: Bitmap,
-    val info: ImageInfo
+    val info: ImageInfo,
+    /**
+     * The app-private copy this was decoded from.
+     *
+     * Carried through so a saved project can point at a file that will still
+     * exist later; the original content URI is only a temporary grant.
+     */
+    val sourceFile: java.io.File
 )
 
 /** Non-editing metadata surfaced in the Info panel. */
@@ -110,7 +117,7 @@ object ImageLoader {
 
             // No manual recycle: the intermediates are unreachable here, so
             // the GC reclaims them once Compose is done with the final bitmap.
-            LoadedImage(working, info)
+            LoadedImage(working, info, file)
         }
 
     /** Decodes a preview from a file this app owns. */

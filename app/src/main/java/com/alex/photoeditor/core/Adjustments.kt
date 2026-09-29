@@ -3,6 +3,7 @@ package com.alex.photoeditor.core
 import android.graphics.Bitmap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
@@ -14,6 +15,7 @@ import kotlin.math.roundToInt
  * All ranges are normalised: [-1f, 1f] for bipolar controls, [0f, 1f] for
  * unipolar ones, and [0f, 4f] for exposure (stops).
  */
+@Serializable
 data class Adjustments(
     val exposure: Float = 0f,
     val brightness: Float = 0f,
@@ -171,6 +173,10 @@ class AdjustmentEngine {
 
         for (i in 0 until n) {
             val argb = px[i]
+            // Preserve the existing alpha so a cutout stays cut out. Forcing
+            // an opaque alpha made every adjustment resurrect the background
+            // the user had just removed.
+            val alpha = argb and OPAQUE
             var r = ((argb shr 16) and 0xFF) * INV255
             var g = ((argb shr 8) and 0xFF) * INV255
             var b = (argb and 0xFF) * INV255
@@ -231,7 +237,7 @@ class AdjustmentEngine {
                 r += lift; g += lift; b += lift
             }
 
-            px[i] = OPAQUE or (to255(r) shl 16) or (to255(g) shl 8) or to255(b)
+            px[i] = alpha or (to255(r) shl 16) or (to255(g) shl 8) or to255(b)
         }
     }
 
