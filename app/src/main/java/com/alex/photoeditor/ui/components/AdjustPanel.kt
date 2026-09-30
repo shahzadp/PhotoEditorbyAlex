@@ -59,30 +59,18 @@ fun AdjustPanel(vm: EditorViewModel) {
             items(AdjustmentKind.entries.toList()) { kind ->
                 val selected = kind == active
                 val isModified = kind.valueIn(state) != 0f
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(20.dp))
-                        .background(
-                            if (selected) MaterialTheme.colorScheme.primary
-                            else MaterialTheme.colorScheme.surfaceVariant
-                        )
-                        .clickable {
-                            vm.selectAdjustment(kind)
-                            sliderValue = kind.valueIn(state)
-                        }
-                        .padding(horizontal = 14.dp, vertical = 8.dp)
-                        .semantics { contentDescription = kind.label }
-                ) {
-                    Text(
-                        text = if (isModified) "${kind.label} •" else kind.label,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (selected) {
-                            MaterialTheme.colorScheme.onPrimary
-                        } else {
-                            MaterialTheme.colorScheme.onSurfaceVariant
-                        }
-                    )
-                }
+                ExpressiveChip(
+                    label = kind.label,
+                    selected = selected,
+                    // A trailing dot marks a control that has been moved off
+                    // its default, so the user can see at a glance what is
+                    // non-zero without reading every value.
+                    marked = isModified,
+                    onClick = {
+                        vm.selectAdjustment(kind)
+                        sliderValue = kind.valueIn(state)
+                    }
+                )
             }
         }
 
@@ -103,30 +91,21 @@ fun AdjustPanel(vm: EditorViewModel) {
             Spacer(Modifier.weight(1f))
             Text(
                 formatValue(active, sliderValue),
-                style = MaterialTheme.typography.bodyMedium,
+                style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.primary,
                 textAlign = TextAlign.End
             )
             Spacer(Modifier.width(8.dp))
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant)
-                    .clickable {
-                        sliderValue = 0f
-                        vm.selectAdjustment(active)
-                        vm.onSliderChange(active, 0f)
-                        vm.onSliderRelease()
-                    }
-                    .padding(horizontal = 10.dp, vertical = 4.dp)
-                    .semantics { contentDescription = "Reset ${active.label}" }
-            ) {
-                Text(
-                    "Reset",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
+            ExpressiveOutlinedButton(
+                text = "Reset",
+                enabled = sliderValue != 0f,
+                onClick = {
+                    sliderValue = 0f
+                    vm.selectAdjustment(active)
+                    vm.onSliderChange(active, 0f)
+                    vm.onSliderRelease()
+                }
+            )
         }
 
         Slider(
@@ -138,9 +117,11 @@ fun AdjustPanel(vm: EditorViewModel) {
             onValueChangeFinished = vm::onSliderRelease,
             valueRange = active.min..active.max,
             colors = SliderDefaults.colors(
+                // Expressive sliders run a thicker active track with a gap
+                // before the thumb, the M3 expressive signature.
                 thumbColor = MaterialTheme.colorScheme.primary,
                 activeTrackColor = MaterialTheme.colorScheme.primary,
-                inactiveTrackColor = MaterialTheme.colorScheme.surfaceVariant
+                inactiveTrackColor = MaterialTheme.colorScheme.surfaceContainerHighest
             ),
             modifier = Modifier
                 .fillMaxWidth()

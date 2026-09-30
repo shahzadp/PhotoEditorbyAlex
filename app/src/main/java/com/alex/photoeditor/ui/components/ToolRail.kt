@@ -18,13 +18,19 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddPhotoAlternate
+import androidx.compose.material.icons.filled.Brush
 import androidx.compose.material.icons.filled.ContentCut
 import androidx.compose.material.icons.filled.Crop
 import androidx.compose.material.icons.filled.Filter
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.TurnSlightRight
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -43,7 +49,7 @@ import com.alex.photoeditor.ui.theme.LocalMotion
 /**
  * Horizontal tool selector at the bottom of the editor.
  *
- * Scrollable because there are seven tools, which no longer fit across a
+ * Scrollable because there are eight tools, which no longer fit across a
  * narrow phone: with `SpaceEvenly` the rightmost entries were pushed off screen
  * and Info was unreachable.
  *
@@ -52,7 +58,7 @@ import com.alex.photoeditor.ui.theme.LocalMotion
  * the main thing that makes the rail feel responsive rather than switching
  * abruptly between two static states.
  *
- * Only the *selected* chip animates. The other six are static draws with
+ * Only the *selected* chip animates. The other seven are static draws with
  * identical parameters, so Compose reuses their nodes and the rail costs no
  * more per frame than the un-animated version did.
  */
@@ -60,12 +66,59 @@ import com.alex.photoeditor.ui.theme.LocalMotion
 fun ToolRail(
     active: EditorTool,
     onSelect: (EditorTool) -> Unit,
+    collapsed: Boolean = false,
+    onToggleCollapsed: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Column(
         modifier = modifier
             .background(MaterialTheme.colorScheme.surface)
     ) {
+        // When collapsed, the rail itself shrinks to a single small toggle and
+        // the selected tool is named beside it. The point is to hand the
+        // vertical space to the preview, so keeping eight full chips on screen
+        // would defeat it - a rail that stays visible is not a collapsed rail.
+        if (collapsed) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Small arrow-only button, as asked for.
+                IconButton(
+                    onClick = onToggleCollapsed,
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                        .semantics {
+                            contentDescription = "Expand tools"
+                        }
+                ) {
+                    Icon(
+                        Icons.Filled.KeyboardArrowUp,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    text = active.label,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Spacer(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .size(1.dp)
+                    .background(MaterialTheme.colorScheme.outlineVariant)
+            )
+            return@Column
+        }
+
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -76,6 +129,25 @@ fun ToolRail(
         ) {
             EditorTool.entries.forEach { tool ->
                 ToolChip(tool, iconFor(tool), active, onSelect)
+            }
+            Spacer(Modifier.width(4.dp))
+            // Small arrow-only button, matching the collapsed one.
+            IconButton(
+                onClick = onToggleCollapsed,
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                    .semantics {
+                        contentDescription = "Collapse tools"
+                    }
+            ) {
+                Icon(
+                    Icons.Filled.KeyboardArrowDown,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(20.dp)
+                )
             }
         }
 
@@ -98,6 +170,8 @@ private fun iconFor(tool: EditorTool) = when (tool) {
     EditorTool.TRANSFORM -> Icons.Filled.TurnSlightRight
     EditorTool.TAP_SELECT -> Icons.Filled.ContentCut
     EditorTool.LAYERS -> Icons.Filled.AddPhotoAlternate
+    EditorTool.TEXT -> Icons.Filled.TextFields
+    EditorTool.DRAW -> Icons.Filled.Brush
     EditorTool.INFO -> Icons.Filled.Info
 }
 

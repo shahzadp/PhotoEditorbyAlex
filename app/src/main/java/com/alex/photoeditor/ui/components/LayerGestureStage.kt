@@ -85,6 +85,9 @@ fun LayerGestureStage(
         var liveY by remember(id) { mutableFloatStateOf(layer.offsetY) }
         var liveScale by remember(id) { mutableFloatStateOf(layer.scale) }
         var liveRot by remember(id) { mutableFloatStateOf(layer.rotationDegrees) }
+        val smoother = remember(id) {
+            RotationSmoother().apply { reset(layer.rotationDegrees) }
+        }
 
         Box(
             modifier = Modifier
@@ -169,10 +172,12 @@ fun LayerGestureStage(
                                 if (prevSpread > 0f && spread > 0f) {
                                     liveScale =
                                         (liveScale * (spread / prevSpread)).coerceIn(0.05f, 3f)
-                                    vm.setLayerScale(id, liveScale)
                                 }
-                                liveRot = wrapDegrees(liveRot + wrapDegrees(angle - prevAngle))
-                                vm.setLayerRotation(id, liveRot)
+                                // Damped: a pinch that is only resizing should not rotate.
+                                // `onDelta` returns the absolute rotation, so
+                                // this is an assignment, not an accumulation.
+                                liveRot = smoother.onDelta(angle - prevAngle)
+                                vm.setLayerTransformLive(id, liveX, liveY, liveScale, liveRot)
                                 prevSpread = spread
                                 prevAngle = angle
                             } else {
@@ -181,15 +186,15 @@ fun LayerGestureStage(
                                 // exactly at any preview size.
                                 liveX = (liveX + delta.x / w).coerceIn(-1f, 1f)
                                 liveY = (liveY + delta.y / h).coerceIn(-1f, 1f)
-                                vm.setLayerOffset(id, liveX, liveY)
+                                vm.setLayerTransformLive(id, liveX, liveY, liveScale, liveRot)
                             }
 
                             prevCentroid = centroid
                         }
 
-                        // Gesture finished: settle the remaining transform.
-                        vm.setLayerScale(id, liveScale)
-                        vm.setLayerRotation(id, liveRot)
+                        // Gesture finished: one history entry for the whole
+                        // drag, rather than one per pointer event.
+                        vm.endTransformGesture("Move layer")
                     }
                 }
                 .semantics { contentDescription = "Drag to move, pinch to resize and rotate" }
@@ -203,6 +208,3 @@ fun LayerGestureStage(
         }
     }
 }
-
-/** Fold an angle into (-180, 180] so incremental rotation never unwinds. */
-private fun wrapDegrees(deg: Float): Float = ((deg + 180f) % 360f + 360f) % 360f - 180f

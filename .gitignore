@@ -28,6 +28,16 @@ build/
 keystore.properties
 signing.properties
 
+# Local signing configuration for build-release.bat. Holds real passwords,
+# so it is deliberately untracked even though the *script* is tracked.
+RELEASE_ENV.bat
+
+# The R8 mapping file maps obfuscated names back to the source. It is
+# effectively a decryption key for the release APK, so it is never committed -
+# keep it out of version control and store it somewhere safe for crash
+# triage.
+app/build/outputs/mapping/
+
 # ---------------------------------------------------------------- IDE
 .idea/
 *.iml

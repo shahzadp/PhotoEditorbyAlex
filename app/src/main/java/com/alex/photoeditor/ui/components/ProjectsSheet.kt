@@ -156,9 +156,11 @@ fun ProjectsSheet(vm: EditorViewModel) {
                             textAlign = TextAlign.Center
                         )
                         Spacer(Modifier.height(18.dp))
-                        androidx.compose.material3.Button(onClick = vm::openNewProjectChooser) {
-                            Text("Add project")
-                        }
+                        ExpressiveTonalButton(
+                            text = "Add project",
+                            icon = Icons.Filled.Add,
+                            onClick = vm::openNewProjectChooser
+                        )
                     }
                 }
 

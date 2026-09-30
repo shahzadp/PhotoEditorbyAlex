@@ -4,7 +4,7 @@
     <!-- No INTERNET permission: this app is 100% offline by design. -->
 
     <application
-        android:label="Photo Editor"
+        android:label="Photo Editor by Alex"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
         android:theme="@style/Theme.PhotoEditor"

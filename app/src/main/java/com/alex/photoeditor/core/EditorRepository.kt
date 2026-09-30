@@ -53,7 +53,31 @@ data class EditState(
      * At most [ImageLayer.MAX_LAYERS]. Held as file paths plus transforms so
      * the state remains serialisable; the bitmaps live in [LayerStore].
      */
-    val layers: List<ImageLayer> = emptyList()
+    val layers: List<ImageLayer> = emptyList(),
+    /**
+     * Text stacked over the base photo.
+     *
+     * A separate list from [layers] with its own cap, so ten images plus ten
+     * text objects can coexist. Text holds no bitmap — it is drawn as vectors
+     * on the Canvas — so a full set of text layers costs no extra memory.
+     */
+    val textLayers: List<TextLayer> = emptyList(),
+    /**
+     * Freehand strokes drawn over the photo.
+     *
+     * Separate from [layers] and [textLayers] because a stroke is a polyline
+     * rather than a bitmap or a string, and it needs its own lifecycle: it
+     * accumulates unboundedly as the user draws, so it has no per-layer cap
+     * and is cleared wholesale by the eraser.
+     */
+    val strokes: List<DrawStroke> = emptyList(),
+    /**
+     * Flood-filled regions, each a seed plus a tolerance.
+     *
+     * Re-derived from the image on every render rather than stored as a mask,
+     * so a fill survives a crop, rotate or resize and costs a handful of bytes.
+     */
+    val fills: List<DrawFill> = emptyList()
 ) {
     val isDefault: Boolean
         get() = adjustments.isNeutral &&
@@ -66,7 +90,10 @@ data class EditState(
             resizeHeight == null &&
             colorGrade.isNeutral &&
             cutout.isNone &&
-            layers.isEmpty()
+            layers.isEmpty() &&
+            textLayers.isEmpty() &&
+            strokes.isEmpty() &&
+            fills.isEmpty()
 
     /** Human-readable summary for the history panel. */
     fun describe(): String = buildList {
@@ -79,6 +106,16 @@ data class EditState(
         if (cutout.isActive) add("Cutout")
         if (layers.isNotEmpty()) {
             add(if (layers.size == 1) "1 layer" else "${layers.size} layers")
+        }
+        if (textLayers.isNotEmpty()) {
+            val n = textLayers.size
+            add(if (n == 1) "1 text" else "$n texts")
+        }
+        if (strokes.isNotEmpty()) {
+            add(if (strokes.size == 1) "1 stroke" else "${strokes.size} strokes")
+        }
+        if (fills.isNotEmpty()) {
+            add(if (fills.size == 1) "1 fill" else "${fills.size} fills")
         }
         if (filterId != "original") add("Filter")
         if (!colorGrade.isNeutral) {
@@ -155,6 +192,14 @@ data class PreviewState(
      */
     val thumbnailMissing: Boolean = true,
     /**
+     * The text stack, mirrored here so the UI can observe it.
+     *
+     * Mirrored for the same reason as [layers]: a composable must take this
+     * from the collected state, not read the repository directly, or it will
+     * not recompose when the stack changes.
+     */
+    val textLayers: List<TextLayer> = emptyList(),
+    /**
      * The layer stack, mirrored here so the UI can observe it.
      *
      * The panel must read the stack from an observable source: reading it
@@ -162,7 +207,15 @@ data class PreviewState(
      * `visible` flag, so the eye toggle kept setting it to the same value and
      * a hidden layer could never be shown again.
      */
-    val layers: List<ImageLayer> = emptyList()
+    val layers: List<ImageLayer> = emptyList(),
+    /**
+     * The drawn strokes, mirrored here so the panel can observe the stack.
+     *
+     * Read from the collected state rather than from the repository directly:
+     * a direct read registers no snapshot observation, so the panel would not
+     * recompose when a stroke was added.
+     */
+    val strokes: List<DrawStroke> = emptyList()
 )
 
 /**
@@ -337,6 +390,7 @@ class EditorRepository(
         current = EditState()
         undoStack.clear()
         redoStack.clear()
+        editingTextId = null
         activeToolIsCrop = false
         cropCanvasKey = null
         cropCanvas = null
@@ -390,6 +444,78 @@ class EditorRepository(
             },
             label
         )
+
+    /**
+     * Snapshot taken when a transform gesture starts, or null when none is live.
+     *
+     * A drag fires on every pointer event, up to ~120 per second. Routing that
+     * through [update] cost two things per event: a history entry, so one drag
+     * buried the undo stack under hundreds of frames, and a full `EditState`
+     * equality walk before the early-return check, which compares every
+     * adjustment, curve point, colour grade and layer - the expensive part,
+     * and the reason dragging lagged behind the finger.
+     *
+     * Live updates therefore mutate [current] directly, exactly like the
+     * adjustment sliders already do, and [endTransformGesture] pushes a single
+     * entry for the whole gesture when the finger lifts.
+     */
+    private var transformGestureStart: EditState? = null
+
+    /**
+     * Live transform of a layer during a drag or pinch.
+     *
+     * No history push and no equality walk: the gesture already knows the
+     * value changed, because the finger moved.
+     */
+    fun setLayerTransformLive(id: String, x: Float, y: Float, scale: Float, degrees: Float) {
+        if (transformGestureStart == null) {
+            transformGestureStart = current
+            interactiveGestureActive = true
+        }
+        endTextRun()
+        current = current.copy(
+            layers = current.layers.map {
+                if (it.id == id) it.copy(offsetX = x, offsetY = y, scale = scale, rotationDegrees = degrees) else it
+            }
+        )
+        markChanged()
+        scheduleRender()
+    }
+
+    fun setTextTransformLive(id: String, x: Float, y: Float, fraction: Float, degrees: Float) {
+        if (transformGestureStart == null) {
+            transformGestureStart = current
+            interactiveGestureActive = true
+        }
+        endTextRun()
+        current = current.copy(
+            textLayers = current.textLayers.map {
+                if (it.id == id) {
+                    it.copy(offsetX = x, offsetY = y, sizeFraction = fraction, rotationDegrees = degrees)
+                } else {
+                    it
+                }
+            }
+        )
+        markChanged()
+        scheduleRender()
+    }
+
+    /** Collapses a whole gesture into one undo entry when the finger lifts. */
+    fun endTransformGesture(label: String) {
+        // Clear before pushing, so the full-quality frame is rendered straight
+        // away rather than after the next unrelated change.
+        if (interactiveGestureActive) {
+            interactiveGestureActive = false
+            scheduleRender()
+        }
+        val start = transformGestureStart ?: return
+        transformGestureStart = null
+        if (start == current) return
+        undoStack.addLast(HistoryEntry(start, label))
+        if (undoStack.size > MAX_HISTORY) undoStack.removeFirst()
+        redoStack.clear()
+    }
 
     fun setLayerScale(id: String, scale: Float) = updateLayer(
         id,
@@ -445,12 +571,264 @@ class EditorRepository(
         state.copy(layers = listOf(target) + state.layers.filterNot { it.id == id })
     }, "Send to back")
 
+    // ------------------------------------------------------- text layers
+
+    val canAddText: Boolean get() = current.textLayers.size < TextLayer.MAX_TEXT_LAYERS
+
+    val textCount: Int get() = current.textLayers.size
+
+    fun addText(text: String = "Text"): String? {
+        if (!canAddText) return null
+        val id = java.util.UUID.randomUUID().toString()
+        update(
+            {
+                it.copy(
+                    textLayers = it.textLayers + TextLayer(
+                        id = id,
+                        text = text,
+                        // Staggered so a second text does not land exactly on
+                        // top of the first, which reads as "nothing happened".
+                        offsetY = -0.25f + it.textLayers.size * 0.06f
+                    )
+                )
+            },
+            "Add text"
+        )
+        return id
+    }
+
+    fun updateText(id: String, transform: (TextLayer) -> TextLayer, label: String) = update(
+        { state ->
+            state.copy(
+                textLayers = state.textLayers.map { if (it.id == id) transform(it) else it }
+            )
+        },
+        label
+    )
+
+    /**
+     * True while the previous history entry was also a text edit of this same
+     * object, so the next one can replace it instead of stacking.
+     */
+    private var editingTextId: String? = null
+
+    /**
+     * Sets the text content, coalescing a whole typing burst into one undo step.
+     *
+     * Every keystroke used to go through [update], which pushes a history entry
+     * per character. Typing "Apple" left five undos to back through, and
+     * because each one also triggered its own render the whole word cost five
+     * full pipeline passes.
+     *
+     * While the run is active - the same object, still typing - the newest
+     * value simply replaces the top entry, so undo steps back over the entire
+     * typed run at once and re-typing is cheap. The run ends as soon as a
+     * different object or a different kind of edit comes through, which is
+     * what stops an unrelated action being swallowed by the coalescing.
+     */
+    fun setTextContent(id: String, text: String) {
+        val coalescing = editingTextId == id
+        val next = current.copy(
+            textLayers = current.textLayers.map { if (it.id == id) it.copy(text = text) else it }
+        )
+        if (next == current) return
+
+        editingTextId = id
+        if (coalescing && undoStack.isNotEmpty()) {
+            // Replace the entry that this same run already pushed. `current`
+            // has to move but the recorded "before" state must not, or undo
+            // would land on a mid-word value.
+            current = next
+            markChanged()
+            scheduleRender()
+            return
+        }
+
+        undoStack.addLast(HistoryEntry(current, "Edit text"))
+        if (undoStack.size > MAX_HISTORY) undoStack.removeFirst()
+        redoStack.clear()
+
+        current = next
+        markChanged()
+        scheduleRender()
+    }
+
+    /**
+     * Ends a typing run so the next edit starts a fresh history entry.
+     *
+     * Called from every path that changes something other than the text being
+     * typed.
+     */
+    private fun endTextRun() {
+        editingTextId = null
+    }
+
+    fun setTextSize(id: String, fraction: Float) = updateText(
+        id,
+        { it.copy(sizeFraction = fraction.coerceIn(0.01f, 0.6f)) },
+        "Text size"
+    )
+
+    fun setTextOffset(id: String, x: Float, y: Float) = updateText(
+        id,
+        { it.copy(offsetX = x.coerceIn(-1f, 1f), offsetY = y.coerceIn(-1f, 1f)) },
+        "Move text"
+    )
+
+    fun setTextRotation(id: String, degrees: Float) = updateText(
+        id,
+        { it.copy(rotationDegrees = ((degrees + 180f) % 360f) - 180f) },
+        "Rotate text"
+    )
+
+    fun setTextColor(id: String, argb: Long) = updateText(
+        id,
+        { it.copy(color = argb) },
+        "Text colour"
+    )
+
+    fun setTextFont(id: String, fontKey: String) = updateText(
+        id,
+        { it.copy(fontKey = fontKey) },
+        "Text font"
+    )
+
+    fun setTextStyle(id: String, bold: Boolean? = null, italic: Boolean? = null) =
+        updateText(
+            id,
+            {
+                it.copy(
+                    bold = bold ?: it.bold,
+                    italic = italic ?: it.italic
+                )
+            },
+            "Text style"
+        )
+
+    fun setTextOpacity(id: String, opacity: Float) = updateText(
+        id,
+        { it.copy(opacity = opacity.coerceIn(0f, 1f)) },
+        "Text opacity"
+    )
+
+    fun setTextVisible(id: String, visible: Boolean) = updateText(
+        id,
+        { it.copy(visible = visible) },
+        "Toggle text"
+    )
+
+    fun resetText(id: String) = updateText(
+        id,
+        {
+            it.copy(
+                offsetX = 0f,
+                offsetY = 0f,
+                rotationDegrees = 0f,
+                sizeFraction = 0.06f
+            )
+        },
+        "Reset text"
+    )
+
+    fun removeText(id: String) = update(
+        { it.copy(textLayers = it.textLayers.filterNot { t -> t.id == id }) },
+        "Remove text"
+    )
+
+    // ------------------------------------------------------------ draw layers
+
+    /** True when anything has been drawn, so the panel can offer a clear-all. */
+    val hasDrawing: Boolean
+        get() = current.strokes.isNotEmpty() || current.fills.isNotEmpty()
+
+    val strokeCount: Int get() = current.strokes.size
+
+    /**
+     * Appends a stroke.
+     *
+     * Called on every pointer *up*, not on every move: one drag is one undo
+     * step, which is what makes undo behave the way a drawing app does. The
+     * live preview comes from the in-progress stroke the stage holds locally,
+     * so the user still sees the line follow their finger.
+     */
+    fun addStroke(stroke: DrawStroke) = update(
+        { it.copy(strokes = it.strokes + stroke) },
+        if (stroke.erase) "Erase" else "Draw"
+    )
+
+    /**
+     * Extends the stroke currently being drawn.
+     *
+     * Mutates [current] directly rather than going through [update], because
+     * this runs once per pointer event and a history entry per event would
+     * both flood the undo stack and make a single drag impossible to undo.
+     */
+    fun appendStrokePoints(id: String, points: List<StrokePoint>) {
+        if (points.isEmpty()) return
+        val existing = current.strokes.firstOrNull { it.id == id } ?: return
+        val merged = existing.copy(points = existing.points + points)
+        endTextRun()
+        current = current.copy(
+            strokes = current.strokes.map { if (it.id == id) merged else it }
+        )
+        markChanged()
+        scheduleRender()
+    }
+
+    /** Fills the region around a normalised point. */
+    fun addFill(fill: DrawFill) = update(
+        { it.copy(fills = it.fills + fill) },
+        "Fill"
+    )
+
+    fun setFillColor(id: String, argb: Long) = update(
+        { it.copy(fills = it.fills.map { if (it.id == id) it.copy(color = argb) else it }) },
+        "Fill colour"
+    )
+
+    fun setStrokeVisible(id: String, visible: Boolean) = update(
+        { it.copy(strokes = it.strokes.map { if (it.id == id) it.copy(visible = visible) else it }) },
+        "Toggle stroke"
+    )
+
+    fun removeStroke(id: String) = update(
+        { it.copy(strokes = it.strokes.filterNot { s -> s.id == id }) },
+        "Remove stroke"
+    )
+
+    /** Removes every stroke and fill. One undo step. */
+    fun clearDrawing() {
+        if (!hasDrawing) return
+        update({ it.copy(strokes = emptyList(), fills = emptyList()) }, "Clear drawing")
+    }
+
+    /**
+     * Recolours every mark already drawn.
+     *
+     * Erase strokes are deliberately left alone: an eraser has no colour, and
+     * "recolour" turning erases into painted lines would be the opposite of
+     * what was asked for.
+     */
+    fun recolourDrawing(argb: Long) = update(
+        {
+            it.copy(
+                strokes = it.strokes.map { s -> if (s.erase) s else s.copy(color = argb) },
+                fills = it.fills.map { f -> f.copy(color = argb) }
+            )
+        },
+        "Brush colour"
+    )
+
     // ------------------------------------------------------- state changes
 
     /** Pushes a new state and re-renders. Used for discrete tool actions. */
     fun update(transform: (EditState) -> EditState, label: String) {
         val next = transform(current)
         if (next == current) return
+
+        // Any non-typing edit closes an open typing run, so the next
+        // keystroke cannot be coalesced into this action.
+        endTextRun()
 
         undoStack.addLast(HistoryEntry(current, label))
         if (undoStack.size > MAX_HISTORY) undoStack.removeFirst()
@@ -472,6 +850,7 @@ class EditorRepository(
 
     fun updateAdjustmentLive(kind: AdjustmentKind, value: Float) {
         val base = sliderGestureStart?.adjustments ?: current.adjustments
+        endTextRun()
         current = current.copy(
             adjustments = kind.with(base, value)
         )
@@ -543,6 +922,7 @@ class EditorRepository(
 
     fun updateCropLive(rect: CropRect) {
         if (cropGestureStart == null) cropGestureStart = current
+        endTextRun()
         current = current.copy(crop = rect)
         markChanged()
         scheduleRender()
@@ -762,6 +1142,7 @@ class EditorRepository(
     // ------------------------------------------------------------- history
 
     fun undo() {
+        endTextRun()
         val entry = undoStack.removeLastOrNull() ?: return
         redoStack.addLast(HistoryEntry(current, entry.label))
         current = entry.state
@@ -770,6 +1151,7 @@ class EditorRepository(
     }
 
     fun redo() {
+        endTextRun()
         val entry = redoStack.removeLastOrNull() ?: return
         undoStack.addLast(HistoryEntry(current, entry.label))
         current = entry.state
@@ -782,6 +1164,7 @@ class EditorRepository(
      * moved onto the redo stack so history stays navigable in both directions.
      */
     fun jumpTo(timelineIndex: Int) {
+        endTextRun()
         val targetEntry = undoStack.getOrNull(timelineIndex) ?: return
         val targetState = targetEntry.state
 
@@ -847,6 +1230,7 @@ class EditorRepository(
             current = project.state
             undoStack.clear()
             redoStack.clear()
+            editingTextId = null
             projectId = project.id
             projectName = project.displayName
             cropSessionReset = true
@@ -968,7 +1352,10 @@ class EditorRepository(
             _preview.value = _preview.value.copy(isRendering = true)
 
             val state = current
-            val result = pipeline(base, state, previewSize = PREVIEW_EDGE)
+            // A smaller frame while the finger is down, for the reason given
+            // on [interactiveGestureActive].
+            val edge = if (interactiveGestureActive) GESTURE_PREVIEW_EDGE else PREVIEW_EDGE
+            val result = pipeline(base, state, previewSize = edge)
 
             // While cropping, the overlay must sit on the *uncropped* image.
             // If it drew on `result` the crop rect would be applied twice and
@@ -982,6 +1369,8 @@ class EditorRepository(
                 bitmap = result,
                 cropBase = cropSource,
                 layers = state.layers,
+                textLayers = state.textLayers,
+                strokes = state.strokes,
                 canUndo = undoStack.isNotEmpty(),
                 canRedo = redoStack.isNotEmpty(),
                 historyIndex = undoStack.size,
@@ -1047,6 +1436,25 @@ class EditorRepository(
     /** Set by the UI so the renderer knows to produce a crop canvas. */
     @Volatile
     var activeToolIsCrop: Boolean = false
+
+    /**
+     * Preview edge used while a transform gesture is live.
+     *
+     * Dragging an object used to re-run the entire pipeline at the full preview
+     * size on *every pointer event* - up to 120 times a second. Each pass
+     * allocates and copies a full ARGB_8888 frame (about 8 MB at 1440px) plus
+     * the compositing layers, so the cost was dominated by allocation and
+     * memory traffic rather than by any arithmetic. The finger therefore
+     * waited on the pipeline and the object visibly trailed it.
+     *
+     * Dropping to a smaller edge during the gesture cuts that allocation by
+     * roughly an order of magnitude. It is a deliberate trade: the frame is
+     * momentarily softer *while the finger is down*, and snaps back to full
+     * sharpness the instant it lifts. Nothing is baked in - the final render
+     * always runs at full quality, so the exported image is unaffected.
+     */
+    @Volatile
+    var interactiveGestureActive: Boolean = false
 
     /**
      * The full non-destructive pipeline.
@@ -1131,5 +1539,14 @@ class EditorRepository(
     private companion object {
         const val MAX_HISTORY = 50
         const val PREVIEW_EDGE = 1440
+
+        /**
+         * Preview edge during a drag or pinch.
+         *
+         * 720 rather than something more aggressive: below roughly 600 the
+         * photo becomes too soft to aim with, and aiming badly is worse than
+         * a slightly soft frame.
+         */
+        const val GESTURE_PREVIEW_EDGE = 720
     }
 }

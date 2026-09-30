@@ -108,6 +108,9 @@ class PipelineRenderer(
         val resizing = resizeW != null && resizeH != null
         val cuttingOut = state.cutout.isActive
         val hasLayers = state.layers.any { it.visible && it.opacity > 0f }
+        val hasText = state.textLayers.any { it.visible && it.opacity > 0f && it.text.isNotBlank() }
+        val hasDraws = state.strokes.any { it.visible && !it.isEmpty && it.opacity > 0f } ||
+            state.fills.any { it.visible && it.opacity > 0f }
 
         // Whether any stage will touch a pixel at all. The cutout is excluded
         // because it is resolved into its own bitmap below, before the layers
@@ -116,7 +119,9 @@ class PipelineRenderer(
             !state.adjustments.isNeutral ||
             !state.colorGrade.isNeutral
 
-        if (!needsColourWork && !cuttingOut && crop == null && !resizing && !hasLayers) {
+        if (!needsColourWork && !cuttingOut && crop == null && !resizing &&
+            !hasLayers && !hasText && !hasDraws
+        ) {
             return@withContext img
         }
 
@@ -152,39 +157,64 @@ class PipelineRenderer(
             img = LayerComposer.compose(img, state.layers, layerBitmaps)
         }
 
-        if (!needsColourWork) {
-            return@withContext img
+        // Text sits above the images: a caption should be able to overlap a
+        // sticker, not disappear behind it. Drawn as vectors, so this costs
+        // one full-resolution copy shared by the whole set of text layers
+        // rather than a bitmap per layer.
+        if (hasText) {
+            img = TextComposer.compose(img, state.textLayers)
         }
 
-        // ---- single shared buffer for every pixel stage
-        val needed = img.width * img.height
-        if (scratch.size < needed) scratch = IntArray(needed)
-        val px = scratch
-        img.getPixels(px, 0, img.width, 0, 0, img.width, img.height)
+        // ---- colour stages
 
-        // Colour stages run in place, in a fixed order so results are
-        // deterministic: filter -> colour grade -> tonal adjustments.
-        FilterLibrary.byId[state.filterId]?.let { filter ->
-            if (filter.id != "original") filterEngine.applyToPixels(px, img.width, img.height, filter)
-        }
-        if (!state.colorGrade.isNeutral) {
-            colorGradeEngine.applyInPlace(px, state.colorGrade)
-        }
-        if (!state.adjustments.isNeutral) {
-            adjustmentEngine.applyToPixels(px, img.width, img.height, state.adjustments)
+        if (needsColourWork) {
+            // ---- single shared buffer for every pixel stage
+            val needed = img.width * img.height
+            if (scratch.size < needed) scratch = IntArray(needed)
+            val px = scratch
+            img.getPixels(px, 0, img.width, 0, 0, img.width, img.height)
+
+            // Colour stages run in place, in a fixed order so results are
+            // deterministic: filter -> colour grade -> tonal adjustments.
+            FilterLibrary.byId[state.filterId]?.let { filter ->
+                if (filter.id != "original") {
+                    filterEngine.applyToPixels(px, img.width, img.height, filter)
+                }
+            }
+            if (!state.colorGrade.isNeutral) {
+                colorGradeEngine.applyInPlace(px, state.colorGrade)
+            }
+            if (!state.adjustments.isNeutral) {
+                adjustmentEngine.applyToPixels(px, img.width, img.height, state.adjustments)
+            }
+
+            // ---- write the result out
+            //
+            // The output bitmap is always freshly allocated. An earlier version
+            // pooled it, which crashed with `IllegalStateException` at
+            // `Bitmap.setPixels`: `render` legitimately returns the *input*
+            // bitmap when no pixel stage applies, and `downscale` returns its
+            // source unchanged for small images, so the original photo got
+            // recycled into the pool and later handed back as the write target.
+            val graded = Bitmap.createBitmap(img.width, img.height, Bitmap.Config.ARGB_8888)
+            graded.setPixels(px, 0, img.width, 0, 0, img.width, img.height)
+            img = graded
         }
 
-        // ---- write the result out
+        // ---- drawing goes on LAST, after the colour stages.
         //
-        // The output bitmap is always freshly allocated. An earlier version
-        // pooled it, which crashed with `IllegalStateException` at
-        // `Bitmap.setPixels`: `render` legitimately returns the *input*
-        // bitmap when no pixel stage applies, and `downscale` returns its
-        // source unchanged for small images, so the original photo got
-        // recycled into the pool and later handed back as the write target.
-        val out = Bitmap.createBitmap(img.width, img.height, Bitmap.Config.ARGB_8888)
-        out.setPixels(px, 0, img.width, 0, 0, img.width, img.height)
-        out
+        // The opposite of the layer stacking above, and deliberately so. A
+        // brush stroke is the user's intent applied to the finished edit: if a
+        // saturation filter or an exposure slider ran over it, a carefully
+        // chosen colour would silently shift, and a solid fill would stop
+        // being solid. The same reasoning means the eyedropper samples the
+        // graded preview, so a picked colour is the colour that will be
+        // painted - not the colour it was before grading.
+        if (hasDraws) {
+            img = DrawComposer.compose(img, state.strokes, state.fills)
+        }
+
+        img
     }
 
     /**
@@ -211,16 +241,53 @@ class PipelineRenderer(
         return out
     }
 
+    /**
+     * Downscale for the preview, memoised on the source bitmap.
+     *
+     * This is the single hottest line in the whole renderer. The preview is
+     * capped at [PREVIEW_EDGE], but the *source* is the full-resolution
+     * original, so every render used to run a bilinear rescale of a 12MP
+     * photo - roughly 12 million pixels read and written - before a single
+     * edit was even applied.
+     *
+     * That was invisible while only sliders moved, because a drag coalesces
+     * into a handful of renders. Typing did not coalesce: every keystroke
+     * produced its own render, so each character cost a full rescale of the
+     * original plus a full re-composite. Typing a word was re-scaling the
+     * photo about six times for nothing.
+     *
+     * The result depends only on the source and the target edge, so it is
+     * cached and reused. Keyed on the source's identity so opening a new photo
+     * cannot serve a stale scale, and on the edge so the export path (which
+     * passes null and never calls this) cannot collide with it.
+     */
+    private var scaledSource: Bitmap? = null
+    private var scaledFor: Bitmap? = null
+    private var scaledEdge: Int = -1
+
     private fun downscale(src: Bitmap, maxEdge: Int): Bitmap {
         val longEdge = maxOf(src.width, src.height)
         if (longEdge <= maxEdge) return src
+
+        if (scaledFor === src && scaledEdge == maxEdge) {
+            scaledSource?.let { if (!it.isRecycled) return it }
+        }
+
         val ratio = maxEdge.toFloat() / longEdge
-        return Bitmap.createScaledBitmap(
+        val scaled = Bitmap.createScaledBitmap(
             src,
             (src.width * ratio).toInt().coerceAtLeast(1),
             (src.height * ratio).toInt().coerceAtLeast(1),
             true
         )
+        // Only ever hold one cache slot. The gesture path alternates between
+        // two edges as a drag starts and ends, and a second entry would pin
+        // two full preview frames in memory for no benefit - the rescale is
+        // cheap next to the compositing it feeds.
+        scaledSource = scaled
+        scaledFor = src
+        scaledEdge = maxEdge
+        return scaled
     }
 
     /** Full-resolution width of the post-geometry frame. */
@@ -240,5 +307,11 @@ class PipelineRenderer(
     fun release() {
         scratch = IntArray(0)
         cutoutScratch = IntArray(0)
+        // The cached scale belongs to the photo that has just been closed, so
+        // holding it would both leak a full preview bitmap and risk handing it
+        // back for a different image later.
+        scaledSource = null
+        scaledFor = null
+        scaledEdge = -1
     }
 }

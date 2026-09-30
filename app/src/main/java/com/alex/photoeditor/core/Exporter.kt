@@ -165,7 +165,7 @@ class Exporter(private val context: Context) {
         val quality = settings.quality.coerceIn(1, 100)
         return when (settings.format) {
             ExportFormat.JPEG -> bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)
-            ExportFormat.PNG -> bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+            ExportFormat.PNG -> compressPng(bitmap, out)
             ExportFormat.WEBP ->
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     bitmap.compress(Bitmap.CompressFormat.WEBP_LOSSY, quality, out)
@@ -174,6 +174,29 @@ class Exporter(private val context: Context) {
                     bitmap.compress(Bitmap.CompressFormat.WEBP, quality, out)
                 }
         }
+    }
+
+    /**
+     * PNG encode, writing through a large buffer.
+     *
+     * `Bitmap.compress` emits the deflate stream in small chunks. Handing it
+     * the resolver's output stream directly meant every one of those chunks
+     * became a separate write syscall into a pipe, which is the single largest
+     * avoidable cost in a PNG export. One large buffer absorbs them.
+     *
+     * Note on the remaining time: lossless PNG is dominated by zlib itself, and
+     * that cost is unavoidable while keeping the file genuinely lossless. The
+     * only ways to go materially faster are to reduce the pixel count or switch
+     * to WebP, so this removes the overhead around the compression rather than
+     * the compression itself.
+     */
+    private fun compressPng(bitmap: Bitmap, out: java.io.OutputStream): Boolean {
+        val buffered = java.io.BufferedOutputStream(out, PNG_BUFFER_BYTES)
+        val ok = bitmap.compress(Bitmap.CompressFormat.PNG, 100, buffered)
+        // Must flush before the caller closes the underlying stream, otherwise
+        // the tail of the PNG can be lost.
+        buffered.flush()
+        return ok
     }
 
     private fun scaleToFit(bitmap: Bitmap, maxEdge: Int): Bitmap {
@@ -194,5 +217,15 @@ class Exporter(private val context: Context) {
             ?: "PhotoEditor_${System.currentTimeMillis()}"
         val cleaned = base.substringBeforeLast('.').ifBlank { "PhotoEditor" }
         return "$cleaned.${settings.format.extension}"
+    }
+
+    private companion object {
+        /**
+         * Write buffer for encoding.
+         *
+         * Large enough that a full deflate stream is written in a handful of
+         * calls rather than thousands.
+         */
+        const val PNG_BUFFER_BYTES = 256 * 1024
     }
 }

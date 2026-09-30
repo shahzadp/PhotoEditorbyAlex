@@ -61,6 +61,12 @@ class TapSelectEngine(
             segmenter = InteractiveSegmenter.createFromOptions(context, options)
             Log.i(TAG, "Segmenter initialised OK")
         } catch (e: Throwable) {
+            // Logged at error with the full cause on purpose. Every failure in
+            // this engine is swallowed so a missing or unloadable model
+            // degrades to "cutout unavailable" instead of taking the editor
+            // down - but that same swallowing is what made an obfuscation
+            // regression invisible, because a stripped protobuf class
+            // produced exactly the same silent nothing as a corrupt file.
             Log.e(TAG, "Failed to initialise interactive segmenter", e)
             segmenter = null
         }

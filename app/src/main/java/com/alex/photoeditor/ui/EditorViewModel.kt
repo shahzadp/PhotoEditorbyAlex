@@ -14,6 +14,9 @@ import com.alex.photoeditor.core.AspectPreset
 import com.alex.photoeditor.core.CropRect
 import com.alex.photoeditor.core.CutoutComposer
 import com.alex.photoeditor.core.CutoutState
+import com.alex.photoeditor.core.DrawBrushes
+import com.alex.photoeditor.core.DrawFill
+import com.alex.photoeditor.core.DrawStroke
 import com.alex.photoeditor.core.EditState
 import com.alex.photoeditor.core.EditorRepository
 import com.alex.photoeditor.core.ExportFormat
@@ -24,6 +27,7 @@ import com.alex.photoeditor.core.ImageLayer
 import com.alex.photoeditor.core.PreviewState
 import com.alex.photoeditor.core.ProjectStore
 import com.alex.photoeditor.core.ProjectSummary
+import com.alex.photoeditor.core.StrokePoint
 import com.alex.photoeditor.core.TapSelectEngine
 import com.alex.photoeditor.ui.components.CropSelection
 import com.alex.photoeditor.ui.components.toCropRect
@@ -45,6 +49,8 @@ enum class EditorTool(val label: String) {
     TRANSFORM("Transform"),
     TAP_SELECT("Cutout"),
     LAYERS("Add image"),
+    TEXT("Text"),
+    DRAW("Draw"),
     INFO("Info")
 }
 
@@ -79,6 +85,20 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     var activeTool by mutableStateOf(EditorTool.ADJUST)
         private set
+
+    /**
+     * True when the tool panel and rail are hidden for a larger preview.
+     *
+     * Deliberately remembered in the ViewModel rather than in Compose state so
+     * it survives switching tools: collapsing is a way of looking at the photo,
+     * not a property of whichever panel happens to be open.
+     */
+    var panelCollapsed by mutableStateOf(false)
+        private set
+
+    fun togglePanelCollapsed() {
+        panelCollapsed = !panelCollapsed
+    }
 
     var activeAdjustment by mutableStateOf(AdjustmentKind.EXPOSURE)
         private set
@@ -224,6 +244,197 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     private val _shareRequest = MutableStateFlow<Uri?>(null)
     val shareRequest: kotlinx.coroutines.flow.StateFlow<Uri?> = _shareRequest
 
+    // ---------------------------------------------------------- text layers
+
+    /** Which text object the panel is editing, or null. */
+    var activeTextId by mutableStateOf<String?>(null)
+        private set
+
+    /**
+     * True while the stage is sampling a colour from the photo.
+     *
+     * Held here rather than in the panel because it changes what the *preview*
+     * does, and the panel does not own the preview. Cleared whenever the
+     * selected text changes, so switching objects never leaves the stage
+     * armed for sampling when the user expects to be able to drag.
+     */
+    var eyedropperActive by mutableStateOf(false)
+        private set
+
+    fun setEyedropper(on: Boolean) {
+        eyedropperActive = on
+    }
+
+    fun addText(): String? {
+        val id = repository.addText()
+        if (id != null) {
+            activeTextId = id
+            eyedropperActive = false
+        }
+        return id
+    }
+
+    fun selectText(id: String) {
+        activeTextId = id
+        eyedropperActive = false
+    }
+
+    fun setTextContent(id: String, text: String) = repository.setTextContent(id, text)
+    fun setTextSize(id: String, f: Float) = repository.setTextSize(id, f)
+    fun setTextOffset(id: String, x: Float, y: Float) = repository.setTextOffset(id, x, y)
+    fun setTextRotation(id: String, d: Float) = repository.setTextRotation(id, d)
+    fun setTextColor(id: String, argb: Long) = repository.setTextColor(id, argb)
+    fun setTextFont(id: String, key: String) = repository.setTextFont(id, key)
+    fun setTextBold(id: String, bold: Boolean) = repository.setTextStyle(id, bold = bold)
+    fun setTextItalic(id: String, italic: Boolean) = repository.setTextStyle(id, italic = italic)
+    fun setTextOpacity(id: String, o: Float) = repository.setTextOpacity(id, o)
+    fun setTextVisible(id: String, visible: Boolean) = repository.setTextVisible(id, visible)
+    fun resetText(id: String) = repository.resetText(id)
+
+    /**
+     * Live transform during a drag or pinch.
+     *
+     * Goes through the repository's no-history path, so a whole gesture costs
+     * one undo step rather than one per pointer event.
+     */
+    fun setLayerTransformLive(id: String, x: Float, y: Float, scale: Float, deg: Float) =
+        repository.setLayerTransformLive(id, x, y, scale, deg)
+
+    fun setTextTransformLive(id: String, x: Float, y: Float, fraction: Float, deg: Float) =
+        repository.setTextTransformLive(id, x, y, fraction, deg)
+
+    fun endTransformGesture(label: String) = repository.endTransformGesture(label)
+
+    fun removeText(id: String) {
+        repository.removeText(id)
+        if (activeTextId == id) activeTextId = null
+    }
+
+    // ------------------------------------------------------------------ draw
+
+    /** The colour the brush and the fill both use. */
+    var drawColor by mutableStateOf(0xFF000000L)
+        private set
+
+    var drawBrushKey by mutableStateOf(DrawBrushes.DEFAULT_KEY)
+        private set
+
+    /**
+     * Brush width as a fraction of the image's shorter edge.
+     *
+     * Stored as a fraction rather than as dp so the stroke keeps its visual
+     * weight on any photo size and at export resolution.
+     */
+    var drawWidthFraction by mutableStateOf(0.012f)
+        private set
+
+    /** True to erase instead of painting. */
+    var drawErase by mutableStateOf(false)
+        private set
+
+    var drawOpacity by mutableStateOf(1f)
+        private set
+
+    /**
+     * True while the fill tool is armed.
+     *
+     * A mode rather than a separate button because both write with the same
+     * colour, and switching between them is exactly one tap.
+     */
+    var drawFillMode by mutableStateOf(false)
+        private set
+
+    /**
+     * Separate from the text eyedropper.
+     *
+     * Both sample the same flattened preview, but they write to different
+     * targets - a text colour and the brush colour - so sharing the flag
+     * would mean arming one silently armed the other.
+     */
+    var drawEyedropperActive by mutableStateOf(false)
+        private set
+
+    /** Id of the stroke currently being drawn, while a gesture is in flight. */
+    var liveStrokeId: String? = null
+        private set
+
+    val drawStrokeCount: Int get() = repository.strokeCount
+    val hasDrawing: Boolean get() = repository.hasDrawing
+
+    fun setBrushColor(argb: Long) {
+        drawColor = argb
+        // Repainting existing marks when the colour changes is what people
+        // expect from a drawing app: pick a new colour, everything you drew
+        // takes it.
+        if (repository.hasDrawing) repository.recolourDrawing(argb)
+    }
+
+    fun setDrawBrush(key: String) {
+        drawBrushKey = key
+    }
+
+    fun setDrawWidth(fraction: Float) {
+        drawWidthFraction = fraction.coerceIn(0.0015f, 0.5f)
+    }
+
+    fun setErasing(on: Boolean) {
+        drawErase = on
+        if (on) drawFillMode = false
+    }
+
+    fun setFillArmed(on: Boolean) {
+        drawFillMode = on
+        if (on) {
+            drawErase = false
+            drawEyedropperActive = false
+        }
+    }
+
+    fun setBrushOpacity(value: Float) {
+        drawOpacity = value.coerceIn(0f, 1f)
+    }
+
+    fun setDrawEyedropper(on: Boolean) {
+        drawEyedropperActive = on
+        if (on) drawFillMode = false
+    }
+
+    fun clearDrawing() = repository.clearDrawing()
+
+    /** Called once when a drawing gesture starts. */
+    fun beginStroke(): String {
+        val id = java.util.UUID.randomUUID().toString()
+        liveStrokeId = id
+        repository.addStroke(
+            DrawStroke(
+                id = id,
+                color = drawColor,
+                widthFraction = drawWidthFraction,
+                brushKey = drawBrushKey,
+                erase = drawErase,
+                opacity = drawOpacity
+            )
+        )
+        return id
+    }
+
+    fun extendStroke(id: String, points: List<StrokePoint>) =
+        repository.appendStrokePoints(id, points)
+
+    fun endStroke() {
+        liveStrokeId = null
+    }
+
+    /** Fills the region around a normalised point in image space. */
+    fun fillAt(x: Float, y: Float) {
+        repository.addFill(
+            DrawFill(id = java.util.UUID.randomUUID().toString(), x = x, y = y, color = drawColor)
+        )
+    }
+
+    /** Colour sampled from the preview by the draw eyedropper. */
+    fun applyDrawSample(argb: Long) = setBrushColor(argb)
+
     private var exportBitmap: Bitmap? = null
 
     /**
@@ -257,6 +468,8 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     fun selectTool(tool: EditorTool) {
         activeTool = tool
+        // A collapsed panel is a deliberate choice about viewing the photo, so
+        // it survives switching tools rather than springing open every time.
         // Tells the renderer to produce the uncropped geometry render. Both
         // crop and tap-to-select need it: the crop overlay sits on it, and
         // taps are recorded against the full uncropped frame so a later crop

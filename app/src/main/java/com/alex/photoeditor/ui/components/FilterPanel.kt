@@ -70,28 +70,11 @@ fun FilterPanel(vm: EditorViewModel) {
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             items(FilterCategory.entries.toList()) { cat ->
-                val isSel = cat == category
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(20.dp))
-                        .background(
-                            if (isSel) MaterialTheme.colorScheme.primary
-                            else MaterialTheme.colorScheme.surfaceVariant
-                        )
-                        .clickable { category = cat }
-                        .padding(horizontal = 14.dp, vertical = 6.dp)
-                        .semantics {
-                            contentDescription = cat.label
-                            this.selected = isSel
-                        }
-                ) {
-                    Text(
-                        cat.label,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (isSel) MaterialTheme.colorScheme.onPrimary
-                        else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
+                ExpressiveChip(
+                    label = cat.label,
+                    selected = cat == category,
+                    onClick = { category = cat }
+                )
             }
         }
 

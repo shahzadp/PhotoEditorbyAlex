@@ -110,7 +110,6 @@ fun LayersPanel(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
-
         if (layers.isEmpty()) {
             Text(
                 text = "Stack up to ${ImageLayer.MAX_LAYERS} images over this one. " +
@@ -129,7 +128,7 @@ fun LayersPanel(
             state = listState,
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(max = 190.dp),
+                .heightIn(max = LIST_HEIGHT),
             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 2.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
@@ -167,15 +166,26 @@ fun LayersPanel(
             )
 
             // --- Ordering and reset
-            Row(
+            ExpressiveButtonRow(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    .padding(horizontal = 12.dp, vertical = 4.dp)
             ) {
-                SmallButton("To front", enabled = true) { vm.bringLayerToFront(active.id) }
-                SmallButton("To back", enabled = true) { vm.sendLayerToBack(active.id) }
-                SmallButton("Reset", enabled = true) { vm.resetLayer(active.id) }
+                ExpressiveOutlinedButton(
+                    text = "To front",
+                    onClick = { vm.bringLayerToFront(active.id) },
+                    modifier = Modifier.weight(1f)
+                )
+                ExpressiveOutlinedButton(
+                    text = "To back",
+                    onClick = { vm.sendLayerToBack(active.id) },
+                    modifier = Modifier.weight(1f)
+                )
+                ExpressiveOutlinedButton(
+                    text = "Reset",
+                    onClick = { vm.resetLayer(active.id) },
+                    modifier = Modifier.weight(1f)
+                )
             }
         }
     }
@@ -183,33 +193,12 @@ fun LayersPanel(
 
 @Composable
 private fun AddLayerButton(enabled: Boolean, onClick: () -> Unit) {
-    val background by animateColorAsState(
-        if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
-        label = "addLayerBackground"
+    ExpressiveTonalButton(
+        text = "Add image",
+        icon = Icons.Filled.Add,
+        enabled = enabled,
+        onClick = onClick
     )
-    val content = if (enabled) {
-        MaterialTheme.colorScheme.onPrimary
-    } else {
-        MaterialTheme.colorScheme.onSurfaceVariant
-    }
-
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .clip(RoundedCornerShape(20.dp))
-            .background(background)
-            .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 9.dp)
-            .semantics { contentDescription = "Add an image on top" }
-    ) {
-        Icon(Icons.Filled.Add, contentDescription = null, tint = content, modifier = Modifier.size(18.dp))
-        Spacer(Modifier.size(6.dp))
-        Text(
-            "Add image",
-            style = MaterialTheme.typography.labelLarge,
-            color = content
-        )
-    }
 }
 
 /**
@@ -250,10 +239,11 @@ private fun LayerRow(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
+            .heightIn(min = ROW_HEIGHT)
             .clip(RoundedCornerShape(14.dp))
             .background(background)
             .clickable(onClick = onClick)
-            .padding(6.dp)
+            .padding(horizontal = 12.dp, vertical = 6.dp)
             .semantics { contentDescription = label }
     ) {
         // Thumbnail
@@ -307,18 +297,21 @@ private fun LayerRow(
             )
         }
 
-        IconToggle(
-            visible = layer.visible,
-            content = content,
-            description = if (layer.visible) "Hide layer" else "Show layer",
+        ExpressiveIconToggle(
+            icon = if (layer.visible) {
+                Icons.Filled.Visibility
+            } else {
+                Icons.Filled.VisibilityOff
+            },
+            // Named specifically so a screen reader says "Hide Layer 3"
+            // rather than an unlabelled "Hide".
+            contentDescription = if (layer.visible) "Hide $label" else "Show $label",
             onClick = onToggleVisible
         )
-        IconToggle(
-            visible = true,
-            content = content,
-            description = "Remove layer",
-            onClick = onRemove,
-            icon = Icons.Filled.Delete
+        ExpressiveIconToggle(
+            icon = Icons.Filled.Delete,
+            contentDescription = "Remove $label",
+            onClick = onRemove
         )
     }
 }
