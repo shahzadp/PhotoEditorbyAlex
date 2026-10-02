@@ -16,19 +16,19 @@ REM  names, so normal development and debugging are unaffected.
 REM
 REM  SIGNING
 REM  -------
-REM  With no keystore configured the APK falls back to the debug key so a
-REM  fresh clone can still produce a release build. That is a convenience
-REM  only - the debug key is public, so such an APK can be replaced by
-REM  anyone and still install over this app. For a real release, either:
+REM  Signing settings are read from keystore.properties next to this
+REM  script, which is git-ignored. Copy keystore.properties.example to get
+REM  started.
 REM
-REM    * pass -D arguments on the command line, or
-REM    * put the four values in gradle.properties (git-ignored), or
-REM    * export them in RELEASE_ENV.bat (git-ignored, never committed).
+REM  There is no fallback. If signing is not configured the Gradle build
+REM  stops with instructions rather than quietly producing a debug-signed
+REM  APK - that APK would install and run, so the problem would not surface
+REM  until the app could no longer be updated.
 REM
 REM  USAGE
 REM  -----
 REM    build-release.bat                 normal release build
-REM    build-release.bat -DRELEASE_STORE_FILE=...
+REM    build-release.bat --install       also install onto a connected device
 REM
 REM ===========================================================================
 
@@ -37,17 +37,11 @@ echo  PHOTO EDITOR BY ALEX - RELEASE BUILD
 echo ============================================
 echo.
 
-REM --- Pick up a git-ignored keystore config if one exists -------------------
-if exist "RELEASE_ENV.bat" (
-    echo  Reading RELEASE_ENV.bat for signing settings...
-    call "RELEASE_ENV.bat"
-    echo.
-)
-
-if "%RELEASE_STORE_FILE%"=="" (
-    echo  [signing] No RELEASE_STORE_FILE set.
-    echo  [signing] Falling back to the DEBUG key - the APK WILL work but is
-    echo  [signing] not meaningfully signed. See the header of this script.
+REM --- Check signing is configured before spending minutes on R8 ----------
+if not exist "keystore.properties" (
+    echo  [signing] keystore.properties not found.
+    echo  [signing] The release build will STOP rather than produce a
+    echo  [signing] debug-signed APK. See the header of this script.
     echo.
 )
 
@@ -84,18 +78,18 @@ echo  APK:      %APK%
 if exist "%APK%" for %%f in ("%APK%") do echo  Size:     %%~zf bytes
 if exist "%MAP%" echo  Mapping:  %MAP%
 echo.
-echo  Verify the signature before distributing:
+echo  Confirm the signature is YOUR key, not the debug one:
 echo    apksigner verify --print-certs "%APK%"
 echo.
-echo  If that shows the debug certificate, it was NOT signed with your key.
+echo  Keep release.jks and its passwords backed up somewhere safe. Losing
+echo  them means the app can never be updated again - Android treats a new
+echo  key as a different app.
 echo ============================================
 
 REM --- Optional: install onto a connected device ----------------------------
-REM Kept separate from the build on purpose. The release APK is signed with a
-REM different key from the debug one whenever a real keystore is configured,
-REM and Android refuses to install one over the other - "signature mismatch".
-REM Installing both therefore needs a uninstall first, which would delete the
-REM user's saved projects, so it is never done automatically.
+REM A differently-signed APK will not install over an existing one; that is
+REM Android's rule, not a fault here. The fix is an uninstall, which deletes
+REM saved projects, so it is never done automatically.
 if /i "%~1"=="--install" goto :install
 goto :done
 

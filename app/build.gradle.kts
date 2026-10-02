@@ -1,3 +1,6 @@
+import java.io.File
+import java.util.Properties
+
 plugins {
   alias(libs.plugins.android.application)
   alias(libs.plugins.compose.compiler)
@@ -17,25 +20,67 @@ android {
         versionName = "1.0"
     }
 
-    // A release build is signed with the debug key so `assembleRelease` works
-    // out of the box. That is a convenience, not a security posture: the debug
-    // key is in the repository and anyone can sign an APK that claims to be
-    // this app. Replace the block below with a real keystore before shipping
-    // anything, or the signature is worth nothing.
+    // ---------------------------------------------------------------- signing
+    //
+    // Resolution order, first match wins:
+    //   1. -D system properties      (CI, one-off builds)
+    //   2. keystore.properties       (local, git-ignored, repeatable)
+    //   3. nothing                   -> the release build FAILS
+    //
+    // The third case is deliberate. It used to fall back to the debug key so
+    // that `assembleRelease` worked on a fresh clone, but that is a trap: a
+    // debug-signed "release" APK installs and runs perfectly, so the problem
+    // is invisible until someone tries to update the real app and Android
+    // rejects it as a signature mismatch. Failing here turns a silent,
+    // hard-to-diagnose problem into an obvious one at build time.
+    // Imported at the top of the file rather than written as `java.util.Properties`
+    // here: inside `android { }` the bare name `java` resolves to Gradle's
+    // JavaPluginExtension, not the package, so the qualified form does not compile.
+    val keystoreProperties = Properties().apply {
+        val f = rootProject.file("keystore.properties")
+        if (f.exists()) f.inputStream().use { stream -> load(stream) }
+    }
+
+    fun signingValue(property: String, systemProperty: String): String? =
+        System.getProperty(systemProperty)
+            ?: keystoreProperties.getProperty(property)
+                ?.takeIf { value -> value.isNotBlank() }
+
+    val releaseStorePath = signingValue("storeFile", "RELEASE_STORE_FILE")
+    val releaseStorePassword = signingValue("storePassword", "RELEASE_STORE_PASSWORD")
+    val releaseKeyAlias = signingValue("keyAlias", "RELEASE_KEY_ALIAS")
+    val releaseKeyPassword = signingValue("keyPassword", "RELEASE_KEY_PASSWORD")
+
+    val hasReleaseSigning = listOf(
+        releaseStorePath, releaseStorePassword, releaseKeyAlias, releaseKeyPassword
+    ).all { !it.isNullOrBlank() }
+
+    // `storeFile` in keystore.properties is documented as relative to that
+    // file's own directory (the repo root). A bare `file(...)` here would
+    // resolve it against the `app/` module instead and fail with
+    // "Keystore file ... not found", so a relative path is anchored at the
+    // root project and an absolute path is passed straight through.
+    val releaseStoreFile = releaseStorePath?.let { path ->
+        val candidate = File(path)
+        if (candidate.isAbsolute) candidate else File(rootProject.projectDir, path)
+    }
+
     signingConfigs {
-        create("release") {
-            storeFile = file(System.getProperty("RELEASE_STORE_FILE") ?: "release.jks")
-            storePassword = System.getProperty("RELEASE_STORE_PASSWORD")
-            keyAlias = System.getProperty("RELEASE_KEY_ALIAS")
-            keyPassword = System.getProperty("RELEASE_KEY_PASSWORD")
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = releaseStoreFile
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
         }
     }
 
     buildTypes {
         release {
-            // Minification was off entirely, so the release APK shipped with
-            // every class, method and field name intact - the source laid out
-            // in readable form. R8 shrinks, renames and strips dead code.
+            // R8 shrinks, renames and strips dead code. Without this the
+            // release APK shipped with every class, method and field name
+            // intact - the source laid out in readable form.
             isMinifyEnabled = true
             isShrinkResources = true
 
@@ -44,21 +89,34 @@ android {
                 "proguard-rules.pro"
             )
 
-            // Signed with a real keystore only when one has been supplied,
-            // otherwise the debug key so `assembleRelease` still works on a
-            // fresh clone.
-            //
-            // Falling back is a convenience and nothing more. The debug key is
-            // public and in the repository, so a build produced that way can be
-            // replaced by anyone and still install over this app. Before any
-            // real distribution, pass the four -D properties in [signingConfigs]
-            // and verify the APK is signed by it.
-            signingConfig = if (
-                System.getProperty("RELEASE_STORE_FILE") != null
-            ) {
+            signingConfig = if (hasReleaseSigning) {
                 signingConfigs.getByName("release")
             } else {
-                signingConfigs.getByName("debug")
+                // Refusing here rather than shipping a debug-signed release.
+                // `buildDebug` and `build-apk.bat` remain unaffected.
+                throw GradleException(
+                    """
+                    |Release signing is not configured, so the release build has been stopped.
+                    |
+                    |Falling back to the debug key would produce an APK that installs and
+                    |runs, but that anyone can replace on a user's device - and which
+                    |cannot later be updated with a real key, because Android treats a
+                    |different signature as a different app.
+                    |
+                    |To fix, create keystore.properties next to this file (git-ignored):
+                    |
+                    |    storeFile=release.jks
+                    |    storePassword=<keystore password>
+                    |    keyAlias=<alias>
+                    |    keyPassword=<key password>
+                    |
+                    |Or pass -D properties instead:
+                    |
+                    |    gradlew assembleRelease -DRELEASE_STORE_FILE=release.jks ...
+                    |
+                    |To build the debug variant instead, run: gradlew assembleDebug
+                    """.trimMargin()
+                )
             }
         }
 

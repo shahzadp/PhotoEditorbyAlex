@@ -23,8 +23,20 @@ app/build/
 build/
 
 # Signing material must never be committed.
+#
+# These are private keys: anyone holding the keystore can sign an APK that
+# replaces this app on a user's device, so they are never tracked. Note that
+# *.p12/*.pem/*.key/*.pkcs12 are covered too - keytool and Android Studio will
+# happily emit any of them, and a new extension would otherwise slip through.
 *.jks
 *.keystore
+*.p12
+*.pfx
+*.pkcs12
+*.pem
+*.key
+*.der
+*.crt
 keystore.properties
 signing.properties
 
@@ -32,10 +44,15 @@ signing.properties
 # so it is deliberately untracked even though the *script* is tracked.
 RELEASE_ENV.bat
 
+# The keystore's own password file, and anything else that looks like one.
+*.pass
+*.password
+secrets.properties
+secrets.json
+
 # The R8 mapping file maps obfuscated names back to the source. It is
 # effectively a decryption key for the release APK, so it is never committed -
-# keep it out of version control and store it somewhere safe for crash
-# triage.
+# keep it out of version control and store it somewhere safe for crash triage.
 app/build/outputs/mapping/
 
 # ---------------------------------------------------------------- IDE
